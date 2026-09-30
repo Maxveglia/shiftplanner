@@ -1,0 +1,242 @@
+# What has to be true before main can ship.
+#
+# This exists because main IS the deploy: the Railway service builds from this
+# branch, so anything merged here reaches managers without a human in between.
+# Before that was true a red build was an inconvenience; now it is an outage.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+
+    # The back-office and tenant-isolation suites talk to a real Postgres --
+    # multi-tenancy here is enforced by FORCE ROW LEVEL SECURITY, which cannot
+    # be exercised against a stub. They self-skip when no database is reachable,
+    # so without this the run would go green having proven far less than it
+    # looks like it proved.
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shiftplanner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shiftplanner"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      APP_DATABASE_URL: postgresql+psycopg://app_user:app_pass@localhost:5432/shiftplanner
+      ADMIN_DATABASE_URL: postgresql+psycopg://postgres:postgres@localhost:5432/shiftplanner
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      # The schema contract test SKIPS itself when there is no key, and a
+      # skipped guard is worse than no guard: the run goes green and nobody
+      # learns the intake is broken until a manager writes a brief. Fail loudly
+      # instead of quietly proving nothing.
+      - name: The API key must be present
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          if [ -z "$ANTHROPIC_API_KEY" ]; then
+            echo "::error::ANTHROPIC_API_KEY is not set, so the schema contract"
+            echo "::error::test would skip and CI would pass without checking"
+            echo "::error::the one thing it exists to check."
+            echo "::error::Add it under Settings > Secrets and variables > Actions."
+            exit 1
+          fi
+
+      - name: Install
+        working-directory: backend
+        run: pip install --no-cache-dir ".[dev]"
+
+      # docker-compose mounts infra/initdb automatically; the Actions service
+      # container has no such hook, so the runtime role is created by hand.
+      # app_user must stay NOSUPERUSER -- FORCE ROW LEVEL SECURITY does not
+      # apply to superusers, so granting it would disable the very barrier the
+      # isolation tests exist to check.
+      - name: Create the runtime role
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d shiftplanner -v ON_ERROR_STOP=1 -f infra/initdb/01-app-role.sql
+
+      - name: Migrate
+        working-directory: backend
+        run: alembic upgrade head
+
+      - name: Tests
+        working-directory: backend
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: python -m pytest -q
+
+  frontend:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install
+        working-directory: frontend
+        run: npm ci
+
+      # `npm run build` is `tsc && vite build` -- the same command the
+      # production image runs, so a type error fails here rather than in a
+      # Railway build log nobody is watching.
+      - name: Typecheck and build
+        working-directory: frontend
+        run: npm run build
+
+      # The rules live here. The generator, the validator that judges what the
+      # model proposes, the pay arithmetic and the polling loop that watches a
+      # generation are all client-side, and until now not one of their tests ran
+      # on a pull request: main IS the deploy, so a broken rest rule reached
+      # managers with nothing in between. It takes two seconds.
+      - name: Tests
+        working-directory: frontend
+        run: npm test
+
+  # Nobody was building this image before a deploy, so the Dockerfile and the
+  # entrypoint were only ever exercised by Railway -- in production, on main,
+  # with no way back except another deploy. This job builds the same image
+  # Railway builds and BOOTS it against a real Postgres, so a container that
+  # cannot start fails here instead of taking the service down.
+  #
+  # It exists because the container stopped running as root: nothing else in
+  # this repository can tell whether an unprivileged process can still migrate,
+  # seed, bind its port and read the frontend it serves.
+  image:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: shiftplanner
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d shiftplanner"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build the image
+        run: docker build -t shiftplanner:ci .
+
+      # The finding this job was added for. `id -u` inside the image reports
+      # the user the ENTRYPOINT would start as; 0 means the change was undone,
+      # by an edit or by a merge that lost the USER line.
+      - name: The image must not run as root
+        run: |
+          uid=$(docker run --rm --entrypoint id shiftplanner:ci -u)
+          echo "the image runs as uid $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::The image runs as root. The Dockerfile must keep its"
+            echo "::error::USER line before the ENTRYPOINT: any code execution"
+            echo "::error::inside a root container is root inside that container."
+            exit 1
+          fi
+
+      # Same reason as in the backend job: docker-compose mounts infra/initdb,
+      # the Actions service container does not.
+      - name: Create the runtime role
+        env:
+          PGPASSWORD: postgres
+        run: psql -h localhost -U postgres -d shiftplanner -v ON_ERROR_STOP=1 -f infra/initdb/01-app-role.sql
+
+      # --network host so "localhost" inside the container is the runner, where
+      # the Postgres service publishes 5432. PLATFORM_ADMIN_* are set so the
+      # admin bootstrap actually runs: it is one of the three things the
+      # entrypoint does before uvicorn, and a boot test that skips it proves
+      # less than it looks like it proves.
+      - name: Boot it
+        run: |
+          docker run -d --name shiftplanner --network host \
+            -e DATABASE_URL="postgresql://postgres:postgres@localhost:5432/shiftplanner" \
+            -e APP_DB_PASSWORD=app_pass \
+            -e JWT_SECRET=ci-secret \
+            -e PORT=8000 \
+            -e PLATFORM_ADMIN_EMAIL=ci@example.com \
+            -e PLATFORM_ADMIN_PASSWORD=ci-password-not-a-secret \
+            shiftplanner:ci
+
+      # Migrations on a fresh database take a while, hence 90s. Every failure
+      # path prints the container log, because the log line is the answer.
+      - name: It must answer /health
+        run: |
+          for i in $(seq 1 90); do
+            if curl -sf http://localhost:8000/health >/dev/null; then
+              echo "healthy after ${i}s"
+              exit 0
+            fi
+            if [ "$(docker inspect -f '{{.State.Running}}' shiftplanner)" != "true" ]; then
+              echo "::error::The container exited before it answered /health."
+              docker logs shiftplanner
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "::error::90s and no /health."
+          docker logs shiftplanner
+          exit 1
+
+      # Reading the frontend off disk is the one thing left that a user without
+      # permissions would fail at, and it fails as a 404 rather than a crash --
+      # a container that boots and serves a blank page.
+      - name: It must serve the frontend it built
+        run: |
+          curl -sf http://localhost:8000/ | grep -q 'id="root"' \
+            || { echo "::error::/ did not return the built index.html."; docker logs shiftplanner; exit 1; }
+
+      # `docker run --entrypoint id` above checks what the image DECLARES.
+      # This checks what is actually serving: the uid of PID 1, the process
+      # uvicorn replaced the entrypoint with. python:3.11-slim ships no ps, so
+      # /proc it is.
+      - name: The serving process must not be root
+        run: |
+          # An empty answer must fail. Without this, a container that died
+          # between the health check and here makes `docker exec` fail, awk
+          # succeed on no input, and the guard print "uid " and pass green --
+          # the exact shape of guard this repository refuses to keep. The
+          # default shell is `bash -e`, with no pipefail, so both halves are
+          # said out loud rather than assumed.
+          set -o pipefail
+          uid=$(docker exec shiftplanner cat /proc/1/status | awk '/^Uid:/ {print $2}')
+          if [ -z "$uid" ]; then
+            echo "::error::Could not read the uid of PID 1 -- is the container still up?"
+            docker logs shiftplanner
+            exit 1
+          fi
+          echo "PID 1 is running as uid $uid"
+          if [ "$uid" = "0" ]; then
+            echo "::error::PID 1 is running as root."
+            exit 1
+          fi
+
+      - name: The boot log, for the record
+        if: always()
+        run: docker logs shiftplanner || true

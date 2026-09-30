@@ -1,0 +1,215 @@
+/* Motion for the components. Speaks the kit in motion.css; the same rules apply.
+
+   The shared pieces every screen is built from -- buttons, cards, dialogs,
+   fields, tables, the undo notice. They are on screen all day, so each move
+   here is the launcher's, made smaller and quicker: a dialog rises 8px, not
+   48; a row takes 380ms, not a second. None of it holds a transform once it
+   has arrived, and all of it stops under reduced motion (block at the end). */
+
+/* --- Glass ---------------------------------------------------------------- */
+
+/* The login's card, made for a page that is read all day: the same dark tint
+   over the stage (never a backdrop blur -- it re-blurs the drifting washes
+   every frame and switches off under any ancestor that animates, which every
+   card does as it rises), a little more opaque so a long table stays calm
+   over the brightest wash, a thin light edge (the Tailwind border) and a lip
+   of light along the top edge where the stage's glow would catch it.
+   `m-glass` is a background colour only, so a caller's `bg-*` still wins,
+   and it stacks with `m-light` (a background image). */
+.m-glass {
+  background-color: rgb(17 29 26 / 0.8);
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.04),
+    0 24px 60px -36px rgb(0 0 0 / 0.7);
+}
+
+/* Something that floats over the page -- a dialog, a menu, the undo notice,
+   the assistant's sheet: solid, a step lighter than a card, because at 97%
+   the page's white text still ghosted through a chat bubble; the glass is in
+   its rim, its lip of light and the menta glow under it, as the login's. */
+.m-glass-float {
+  background-color: #13201c;
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.05),
+    0 32px 90px -32px rgb(0 0 0 / 0.85),
+    0 40px 120px -48px rgb(20 161 132 / 0.35);
+}
+
+/* --- Buttons -------------------------------------------------------------- */
+
+/* The quiet buttons' text is grey, and a grey ripple reads as a smudge:
+   theirs is menta instead -- the light one, since the brand's own green is
+   close to the colour of the glass it spreads over. */
+.m-btn-quiet .m-ripple {
+  background: #44d6b4;
+}
+
+/* The primary glows in its own green at rest, as the login's submit does, and
+   lifts a touch more towards the pointer: the way the launcher's tiles glow in
+   their app's colour. A disabled one keeps no glow -- it is not on offer --
+   except the sign-in's, which waits in its own colour (authStyles.ts). */
+.m-btn-glow {
+  box-shadow:
+    0 8px 24px -12px rgb(68 214 180 / 0.55),
+    inset 0 1px 0 rgb(255 255 255 / 0.1);
+}
+.m-btn-glow:disabled:not(.auth-submit) {
+  box-shadow: none;
+}
+.m-btn-glow:not(:disabled):hover {
+  box-shadow:
+    0 12px 32px -10px rgb(68 214 180 / 0.7),
+    inset 0 1px 0 rgb(255 255 255 / 0.14);
+}
+
+/* --- Cards ---------------------------------------------------------------- */
+
+/* Cards side by side arrive one after another, in the order they sit. `--d`
+   is inherited, so what a card holds arrives with it. */
+.m-card:nth-child(2) {
+  --d: 60ms;
+}
+.m-card:nth-child(3) {
+  --d: 120ms;
+}
+.m-card:nth-child(4) {
+  --d: 180ms;
+}
+.m-card:nth-child(n + 5) {
+  --d: 240ms;
+}
+
+/* --- Dialogs -------------------------------------------------------------- */
+
+/* The page behind dims and softens; the dialog rises out of it (`m-pop`, in
+   the kit) and, closed, sinks back the way it came. */
+@keyframes m-scrim-in {
+  from {
+    opacity: 0;
+  }
+}
+.m-scrim-in {
+  animation: m-scrim-in 220ms ease-out backwards;
+}
+
+@keyframes m-scrim-out {
+  to {
+    opacity: 0;
+  }
+}
+.m-scrim-out {
+  animation: m-scrim-out 180ms ease-in forwards;
+}
+
+@keyframes m-pop-out {
+  to {
+    opacity: 0;
+    transform: translateY(6px) scale(0.97);
+    filter: blur(3px);
+  }
+}
+.m-pop-out {
+  transform-origin: var(--origin, 50% 0%);
+  animation: m-pop-out 170ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+/* A panel that belongs to the side of the screen comes in from that side. */
+@keyframes m-sheet-in {
+  from {
+    transform: translateX(100%);
+  }
+}
+.m-sheet-in {
+  animation: m-sheet-in 420ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+@keyframes m-sheet-out {
+  to {
+    transform: translateX(100%);
+  }
+}
+.m-sheet-out {
+  animation: m-sheet-out 220ms cubic-bezier(0.4, 0, 1, 1) forwards;
+}
+
+/* The close cross turns a quarter on hover: it answers the pointer before
+   the click does. */
+.m-close-x {
+  transition: transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+button:hover > .m-close-x {
+  transform: rotate(90deg);
+}
+
+/* --- Fields --------------------------------------------------------------- */
+
+/* The focus ring grows out from the edge instead of snapping on (the ring
+   itself is Tailwind's `focus:ring-*`, a box-shadow, which is what moves). */
+.m-field {
+  transition:
+    border-color 160ms ease,
+    box-shadow 240ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    background-color 160ms ease;
+}
+
+/* --- Tables --------------------------------------------------------------- */
+
+/* Rows arrive one after another the first time a table has any (TBody sets
+   each row's `--d` and takes the class off once they are in). No blur: a
+   filter animated on every row of a long table is repainted row by row in
+   Safari, and the screen stalled for a good part of a second as the
+   inventory opened. Opacity and a lift carry the same entrance. */
+@keyframes m-row-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+  }
+}
+.m-rows > tr {
+  animation: m-row-in 380ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* --- Notices -------------------------------------------------------------- */
+
+/* The undo notice rises from the bottom edge and settles on a spring. */
+@keyframes m-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(24px) scale(0.96);
+  }
+}
+.m-toast-in {
+  animation: m-toast-in 520ms cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
+}
+
+/* A spinner waits a beat before it shows: most loads finish sooner, and one
+   that flashes for a frame reads as a flicker rather than as progress. */
+@keyframes m-spinner-in {
+  from {
+    opacity: 0;
+  }
+}
+.m-spinner-in {
+  animation: m-spinner-in 300ms ease-out 180ms backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-scrim-in,
+  .m-scrim-out,
+  .m-pop-out,
+  .m-sheet-in,
+  .m-sheet-out,
+  .m-rows > tr,
+  .m-toast-in,
+  .m-spinner-in {
+    animation: none;
+  }
+  .m-close-x,
+  .m-field {
+    transition: none;
+  }
+  button:hover > .m-close-x {
+    transform: none;
+  }
+}

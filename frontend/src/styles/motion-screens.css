@@ -1,0 +1,87 @@
+/* Motion and theme for the other screens: the employee's, the welcome
+   questions, inventory and the back office. Speaks the kit in motion.css.
+
+   They stand on the launcher's stage (AppStage) like the rest of the app, and
+   dress in the sign-in's materials: dark glass over the washes of colour,
+   thin light edges, menta for what is live. Everything here is a tint rather
+   than a backdrop blur -- motion-auth.css says why: what is behind is already
+   a blur, and re-blurring it every frame costs a phone its battery and
+   switches off whenever an ancestor animates. */
+
+/* --- Glass ----------------------------------------------------------------- */
+
+/* A panel: the sign-in card at rest. Opaque enough that text on it keeps its
+   contrast wherever the colour behind happens to be brightest (gray-500 stays
+   above 6.5:1 over the menta wash), translucent enough that the stage still
+   glows through its edge. */
+.sc-glass {
+  background-color: rgb(17 29 26 / 0.84);
+  border: 1px solid rgb(255 255 255 / 0.08);
+  box-shadow:
+    0 28px 60px -40px rgb(0 0 0 / 0.9),
+    inset 0 1px 0 rgb(255 255 255 / 0.04);
+}
+
+/* The one panel that is the reason for the screen -- the employee's next
+   shift, the question being asked -- lit from its corner in menta. */
+.sc-hero {
+  background:
+    radial-gradient(120% 160% at 0% 0%, rgb(14 124 102 / 0.34), transparent 58%),
+    rgb(17 29 26 / 0.88);
+  border: 1px solid rgb(68 214 180 / 0.22);
+  box-shadow:
+    0 30px 80px -44px rgb(20 161 132 / 0.7),
+    inset 0 1px 0 rgb(255 255 255 / 0.06);
+}
+
+/* A bar across the top of a screen that scrolls under it. Nearly opaque: with
+   no blur behind it, text passing underneath read through at 92%. */
+.sc-bar {
+  background-color: rgb(11 21 18 / 0.97);
+  border-bottom: 1px solid rgb(255 255 255 / 0.06);
+}
+
+/* Today, and anything else that is "now": a menta edge and a low glow. */
+.sc-now {
+  border-color: rgb(68 214 180 / 0.45);
+  box-shadow:
+    0 0 0 1px rgb(68 214 180 / 0.18),
+    0 24px 60px -34px rgb(68 214 180 / 0.55);
+}
+
+/* The employee's own bar on the team's day: the brand, glowing. */
+.sc-self-bar {
+  box-shadow: 0 8px 22px -10px rgb(68 214 180 / 0.75);
+}
+
+/* --- Arrival --------------------------------------------------------------- */
+
+/* The employee's panels arrive one after another the first time the screen
+   opens, the launcher's rise made small: 10px, not 48. `--i` is the panel's
+   place on the screen. Nothing is held once it is in. */
+@keyframes sc-rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+    filter: blur(4px);
+  }
+}
+.sc-rise {
+  animation: sc-rise 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: calc(var(--i, 0) * 70ms);
+}
+
+/* --- The back office -------------------------------------------------------- */
+
+/* The operator's rail: the same glass, cooled towards slate so that it never
+   reads as a customer's workspace (BackOfficeLayout says why that matters). */
+.sc-ops-rail {
+  background-color: rgb(15 23 32 / 0.9);
+  border-color: rgb(148 163 184 / 0.14);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .sc-rise {
+    animation: none;
+  }
+}

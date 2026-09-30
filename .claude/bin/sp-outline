@@ -1,0 +1,1170 @@
+#!/usr/bin/env python3
+"""sp-outline: el índice de un fichero, con números de línea, para leer solo el tramo.
+
+    sp-outline <fichero> [--todo] [--min N]
+
+Cada entrada es `L<ini>-<fin> (<n>) <firma>`: con eso basta un
+`Read(offset=<ini>, limit=<n>)` en vez de leer el fichero entero.
+
+  Python      ast: def/class de primer nivel (con la ruta si es un endpoint),
+              métodos de las clases, constantes de más de 15 líneas.
+  TS/TSX/JS   sin dependencias: declaraciones de primer nivel; los imports en
+              una línea.
+  Markdown    los títulos, con el tramo de cada sección.
+  Otros       solo líneas y tokens.
+
+Un bloque de más de 250 líneas (el componente de una página, un describe)
+lista también sus hijas directas de al menos --min líneas (12 por defecto):
+hooks, handlers, funciones internas, el `return (` y, dentro de la JSX, los
+comentarios {/* ... */} que hacen de título. --todo lo enseña todo, sin mínimo
+ni recorte; sin él la salida no pasa de ~120 líneas.
+
+Solo biblioteca estándar; vale con Python 3.9 (el de macOS) y 3.11+.
+"""
+
+import ast
+import os
+import re
+import subprocess
+import sys
+
+MAX_OUT = 120          # líneas de salida sin --todo
+BIG_BLOCK = 250        # a partir de aquí se listan las hijas
+DEFAULT_MIN = 12       # tamaño mínimo de una hija para salir
+CONST_MIN = 15         # constantes de primer nivel: solo si pasan de esto
+WIDTH = 108            # ancho máximo de una línea del índice
+JSX_TITLE = 70         # recorte de los comentarios-título de la JSX
+MAX_DEPTH = 3          # anidamiento máximo al expandir bloques gordos
+
+TS_EXT = {".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"}
+PY_EXT = {".py", ".pyi"}
+MD_EXT = {".md", ".markdown", ".mdx"}
+
+
+# --------------------------------------------------------------------------
+# Utilidades comunes (sp-mapa las importa)
+# --------------------------------------------------------------------------
+
+def tokens_of(text):
+    return int(round(len(text) / 3.5))
+
+
+def fmt_tokens(n):
+    if n >= 100000:
+        return "%dk" % int(round(n / 1000.0))
+    if n >= 10000:
+        return "%.1fk" % (n / 1000.0)
+    return str(n)
+
+
+def clip(s, width):
+    s = s.rstrip()
+    if len(s) <= width:
+        return s
+    return s[: max(1, width - 1)].rstrip() + "…"
+
+
+def squash(s):
+    return re.sub(r"\s+", " ", s).strip()
+
+
+def indent_of(line):
+    n = 0
+    for ch in line:
+        if ch == " ":
+            n += 1
+        elif ch == "\t":
+            n += 4
+        else:
+            break
+    return n
+
+
+def read_text(path):
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    if b"\0" in raw[:4096]:
+        return None
+    return raw.decode("utf-8", errors="replace")
+
+
+def repo_root(start=None):
+    """Raíz del checkout desde la carpeta actual; si no, la del propio script."""
+    for where in (start or os.getcwd(), os.path.dirname(os.path.realpath(__file__))):
+        try:
+            out = subprocess.run(
+                ["git", "rev-parse", "--show-toplevel"],
+                cwd=where, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                universal_newlines=True, check=True,
+            ).stdout.strip()
+            if out:
+                return out
+        except (subprocess.CalledProcessError, OSError):
+            continue
+    return None
+
+
+def resolve(arg, root):
+    """La ruta tal cual (relativa a la carpeta actual) y, si no existe, desde la raíz."""
+    if os.path.exists(arg):
+        return os.path.abspath(arg)
+    if root and not os.path.isabs(arg):
+        cand = os.path.join(root, arg)
+        if os.path.exists(cand):
+            return os.path.abspath(cand)
+    return None
+
+
+def display_path(path, root):
+    if root:
+        try:
+            rel = os.path.relpath(path, root)
+            if not rel.startswith(".."):
+                return rel
+        except ValueError:
+            pass
+    return path
+
+
+_SENT_END = re.compile(r"(?<=[.!?])[\"'»)]?\s+(?=[A-ZÁÉÍÓÚÑ¿¡\"'`«(*_\[])")
+
+
+def first_sentence(paragraph):
+    """Primera frase de un párrafo ya aplanado."""
+    p = squash(paragraph)
+    if not p:
+        return ""
+    m = _SENT_END.search(p)
+    if m and m.start() >= 12:
+        p = p[: m.start()]
+    return p.strip()
+
+
+def _first_paragraph(lines):
+    out = []
+    for ln in lines:
+        if not ln.strip():
+            if out:
+                break
+            continue
+        out.append(ln.strip())
+    return " ".join(out)
+
+
+def py_header(text, tree=None):
+    """Primera frase del docstring del módulo (también si va tras __future__)
+    o, si no hay, del primer bloque de comentarios #."""
+    if tree is None:
+        try:
+            tree = ast.parse(text)
+        except (SyntaxError, ValueError):
+            tree = None
+    if tree is not None:
+        for node in tree.body:
+            if isinstance(node, ast.ImportFrom) and node.module == "__future__":
+                continue
+            if (isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant)
+                    and isinstance(node.value.value, str)):
+                doc = node.value.value.strip("\n")
+                import inspect
+                return first_sentence(_first_paragraph(inspect.cleandoc(doc).splitlines()))
+            break
+    # comentario # de cabecera
+    block = []
+    for ln in text.splitlines()[:60]:
+        s = ln.strip()
+        if s.startswith("#!") or re.match(r"#.*coding[:=]", s) or s.startswith("# noqa") \
+                or s.startswith("# type:") or s.startswith("# pylint"):
+            continue
+        if s.startswith("#"):
+            block.append(s.lstrip("#").strip())
+            continue
+        if not s and not block:
+            continue
+        if not s and block:
+            break
+        if block:
+            break
+        if s.startswith(("from __future__", "import ", "from ")):
+            continue
+        break
+    return first_sentence(_first_paragraph(block)) if block else ""
+
+
+def _comment_block_at(lines, i):
+    """Texto del bloque de comentario (// o /* */) que empieza en la línea i."""
+    s = lines[i].strip()
+    body = []
+    if s.startswith("//"):
+        j = i
+        while j < len(lines) and lines[j].strip().startswith("//"):
+            body.append(lines[j].strip()[2:].lstrip("/").strip())
+            j += 1
+        return body
+    if s.startswith("/*"):
+        j = i
+        while j < len(lines):
+            t = lines[j].strip()
+            if j == i:
+                t = t[2:].lstrip("*")
+            end = "*/" in t
+            t = t.split("*/")[0]
+            t = t.strip()
+            if t.startswith("*"):
+                t = t[1:].strip()
+            body.append(t)
+            if end:
+                break
+            j += 1
+        return body
+    return body
+
+
+def ts_header(text, path=None):
+    """Comentario de cabecera antes del primer código; si no hay, el del
+    componente/export con el nombre del fichero; si no, el primer comentario
+    de primer nivel."""
+    lines = text.splitlines()
+    for i, ln in enumerate(lines[:80]):
+        s = ln.strip()
+        if not s or s.startswith(("'use ", '"use ', "#!", "///")):
+            continue
+        if s.startswith(("//", "/*")):
+            if s.startswith(("// eslint", "/* eslint", "// @ts-", "/* @ts-", "// prettier")):
+                continue
+            return first_sentence(_first_paragraph(_comment_block_at(lines, i)))
+        break
+    stem = None
+    if path:
+        stem = os.path.splitext(os.path.basename(path))[0]
+    if stem:
+        pat = re.compile(r"^export\s+(default\s+)?(async\s+)?(function|const|class)\s+%s\b"
+                         % re.escape(stem))
+        for i, ln in enumerate(lines):
+            if pat.match(ln):
+                j = i - 1
+                while j >= 0 and not lines[j].strip():
+                    j -= 1
+                if j >= 0 and lines[j].strip().endswith("*/"):
+                    k = j
+                    while k >= 0 and "/*" not in lines[k]:
+                        k -= 1
+                    if k >= 0:
+                        return first_sentence(_first_paragraph(_comment_block_at(lines, k)))
+                if j >= 0 and lines[j].strip().startswith("//"):
+                    k = j
+                    while k > 0 and lines[k - 1].strip().startswith("//"):
+                        k -= 1
+                    return first_sentence(_first_paragraph(_comment_block_at(lines, k)))
+                break
+    # el primer comentario de primer nivel que no va pegado a una declaración
+    # (el JSDoc de un helper habla del helper, no del fichero)
+    i = 0
+    while i < len(lines):
+        ln = lines[i]
+        if ln.startswith(("//", "/*")) and not ln.startswith(("// eslint", "/* eslint", "///")):
+            block = _comment_block_at(lines, i)
+            end = i + max(1, len(block)) - 1
+            if end + 1 >= len(lines) or not lines[end + 1].strip():
+                return first_sentence(_first_paragraph(block))
+            i = end + 1
+            continue
+        i += 1
+    return ""
+
+
+def md_header(text):
+    lines = text.splitlines()
+    in_front = bool(lines) and lines[0].strip() == "---"
+    for i, ln in enumerate(lines[:120]):
+        s = ln.strip()
+        if in_front:
+            if i > 0 and s == "---":
+                in_front = False
+            elif s.startswith("description:"):
+                return first_sentence(s.split(":", 1)[1].strip().strip("\"'"))
+            continue
+        if s.startswith("#"):
+            return s.lstrip("#").strip()
+        if s:
+            return first_sentence(_first_paragraph(lines[i:i + 8]))
+    return ""
+
+
+def other_header(text, ext):
+    lines = text.splitlines()
+    for i, ln in enumerate(lines[:40]):
+        s = ln.strip()
+        if not s or s.startswith("#!"):
+            continue
+        if ext in (".sh", ".bash", ".toml", ".yml", ".yaml") and s.startswith("#"):
+            block = []
+            for t in lines[i:]:
+                if not t.strip().startswith("#"):
+                    break
+                block.append(t.strip().lstrip("#").strip())
+            return first_sentence(_first_paragraph(block))
+        if ext == ".sql" and s.startswith("--"):
+            block = []
+            for t in lines[i:]:
+                if not t.strip().startswith("--"):
+                    break
+                block.append(t.strip().lstrip("-").strip())
+            return first_sentence(_first_paragraph(block))
+        if s.startswith("/*"):
+            return first_sentence(_first_paragraph(_comment_block_at(lines, i)))
+        break
+    return ""
+
+
+def header_of(path, text):
+    ext = os.path.splitext(path)[1].lower()
+    if ext in PY_EXT:
+        return py_header(text)
+    if ext in TS_EXT:
+        return ts_header(text, path)
+    if ext in MD_EXT:
+        return md_header(text)
+    return other_header(text, ext)
+
+
+# --------------------------------------------------------------------------
+# Entradas del índice
+# --------------------------------------------------------------------------
+
+class Entry(object):
+    __slots__ = ("start", "end", "label", "depth", "kind", "pinned")
+
+    def __init__(self, start, end, label, depth=0, kind="decl", pinned=False):
+        self.start = start        # 1-based
+        self.end = end            # 1-based, inclusive
+        self.label = label
+        self.depth = depth
+        self.kind = kind          # decl | child | jsx | import | method | section
+        self.pinned = pinned      # no se recorta nunca
+
+    @property
+    def size(self):
+        return self.end - self.start + 1
+
+    def render(self):
+        pad = "  " * self.depth
+        if self.kind == "jsx":
+            head = "%sL%d " % (pad, self.start)
+            return clip(head + self.label, WIDTH)
+        if self.start == self.end:
+            head = "%sL%d (1) " % (pad, self.start)
+        else:
+            head = "%sL%d-%d (%d) " % (pad, self.start, self.end, self.size)
+        return clip(head + self.label, WIDTH)
+
+
+# --------------------------------------------------------------------------
+# Python
+# --------------------------------------------------------------------------
+
+ROUTE_METHODS = {"get", "post", "put", "patch", "delete", "head", "options",
+                 "websocket", "api_route", "api_websocket_route"}
+
+
+def _router_prefixes(tree):
+    out = {}
+    for node in tree.body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and isinstance(node.value, ast.Call):
+            fn = node.value.func
+            name = fn.attr if isinstance(fn, ast.Attribute) else getattr(fn, "id", "")
+            if name not in ("APIRouter", "Blueprint", "Router"):
+                continue
+            prefix = ""
+            for kw in node.value.keywords:
+                if kw.arg in ("prefix", "url_prefix") and isinstance(kw.value, ast.Constant):
+                    prefix = str(kw.value.value)
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    out[t.id] = prefix
+    return out
+
+
+def _deco_labels(node, prefixes):
+    route, others = None, []
+    for d in node.decorator_list:
+        call = d if isinstance(d, ast.Call) else None
+        fn = call.func if call else d
+        if (call and isinstance(fn, ast.Attribute) and fn.attr in ROUTE_METHODS
+                and isinstance(fn.value, ast.Name)):
+            path = ""
+            if call.args and isinstance(call.args[0], ast.Constant):
+                path = str(call.args[0].value)
+            else:
+                for kw in call.keywords:
+                    if kw.arg == "path" and isinstance(kw.value, ast.Constant):
+                        path = str(kw.value.value)
+            verb = fn.attr.upper()
+            if verb == "API_ROUTE":
+                verb = "ROUTE"
+                for kw in call.keywords:
+                    if kw.arg == "methods" and isinstance(kw.value, (ast.List, ast.Tuple)):
+                        verb = "/".join(str(e.value) for e in kw.value.elts
+                                        if isinstance(e, ast.Constant))
+            route = "%s %s%s" % (verb, prefixes.get(fn.value.id, ""), path)
+            continue
+        if isinstance(fn, ast.Attribute):
+            others.append("@" + fn.attr)
+        elif isinstance(fn, ast.Name):
+            others.append("@" + fn.id)
+    return route, others[:2]
+
+
+def _py_args(args):
+    parts = []
+    posonly = getattr(args, "posonlyargs", [])
+    for a in posonly:
+        parts.append(a.arg)
+    if posonly:
+        parts.append("/")
+    for a in args.args:
+        parts.append(a.arg)
+    if args.vararg:
+        parts.append("*" + args.vararg.arg)
+    elif args.kwonlyargs:
+        parts.append("*")
+    for a in args.kwonlyargs:
+        parts.append(a.arg)
+    if args.kwarg:
+        parts.append("**" + args.kwarg.arg)
+    return ", ".join(parts)
+
+
+def _unparse(node):
+    try:
+        return ast.unparse(node)  # 3.9+
+    except Exception:
+        return "…"
+
+
+def _py_sig(node):
+    kw = "async def" if isinstance(node, ast.AsyncFunctionDef) else "def"
+    sig = "%s %s(%s)" % (kw, node.name, _py_args(node.args))
+    if node.returns is not None:
+        sig += " -> " + squash(_unparse(node.returns))
+    return sig
+
+
+def _py_class_label(node):
+    bases = [squash(_unparse(b)) for b in node.bases]
+    bases += ["%s=%s" % (k.arg, squash(_unparse(k.value))) for k in node.keywords if k.arg]
+    label = "class %s" % node.name
+    if bases:
+        label += "(%s)" % ", ".join(bases)
+    fields = sum(1 for b in node.body if isinstance(b, (ast.AnnAssign, ast.Assign)))
+    if fields:
+        label += "  [%d campo%s]" % (fields, "" if fields == 1 else "s")
+    return label
+
+
+def _py_start(node):
+    starts = [node.lineno] + [d.lineno for d in getattr(node, "decorator_list", [])]
+    return min(starts)
+
+
+def _py_first_line(lines, lineno):
+    return squash(lines[lineno - 1]) if 0 < lineno <= len(lines) else ""
+
+
+def _py_node_label(node, lines, prefixes):
+    if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        route, decos = _deco_labels(node, prefixes)
+        label = _py_sig(node)
+        if route:
+            label = route + "  " + label
+        elif decos:
+            label = label + "  " + " ".join(decos)
+        return label
+    if isinstance(node, ast.ClassDef):
+        _, decos = _deco_labels(node, prefixes)
+        label = _py_class_label(node)
+        if decos:
+            label += "  " + " ".join(decos)
+        return label
+    return _py_first_line(lines, node.lineno)
+
+
+def _py_children(node, lines, depth, opts, prefixes, out):
+    """Hijas directas de un bloque gordo (función o clase de > BIG_BLOCK líneas)."""
+    body = getattr(node, "body", [])
+    if isinstance(node, ast.ClassDef):
+        for ch in body:
+            if isinstance(ch, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                e = Entry(_py_start(ch), ch.end_lineno, _py_node_label(ch, lines, prefixes),
+                          depth, "method")
+                out.append(e)
+                if e.size > BIG_BLOCK and depth < MAX_DEPTH:
+                    _py_children(ch, lines, depth + 1, opts, prefixes, out)
+        return
+    if (node.end_lineno - _py_start(node) + 1) <= BIG_BLOCK:
+        return
+    for ch in body:
+        start = _py_start(ch)
+        size = ch.end_lineno - start + 1
+        if (isinstance(ch, ast.Expr) and isinstance(getattr(ch, "value", None), ast.Constant)
+                and isinstance(ch.value.value, str)):
+            continue  # docstring
+        if size < opts["min"] and not opts["todo"]:
+            continue
+        e = Entry(start, ch.end_lineno, _py_node_label(ch, lines, prefixes), depth, "child")
+        out.append(e)
+        if size > BIG_BLOCK and depth < MAX_DEPTH and hasattr(ch, "body"):
+            _py_children(ch, lines, depth + 1, opts, prefixes, out)
+
+
+def outline_python(text, lines, opts):
+    try:
+        tree = ast.parse(text)
+    except (SyntaxError, ValueError) as exc:
+        entries = outline_python_fallback(lines, opts)
+        note = "sin ast (%s en L%s con Python %d.%d): índice por sangría" % (
+            type(exc).__name__, getattr(exc, "lineno", "?"),
+            sys.version_info[0], sys.version_info[1])
+        return py_header(text), entries, note
+    prefixes = _router_prefixes(tree)
+    entries = []
+    imports = [n for n in tree.body if isinstance(n, (ast.Import, ast.ImportFrom))]
+    first_def = next((n.lineno for n in tree.body
+                      if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))),
+                     10 ** 9)
+    early = [n for n in imports if n.lineno < first_def]
+    late = [n for n in imports if n.lineno >= first_def]
+    if early:
+        label = "imports (%d)" % len(early)
+        if late:
+            label += " (+%d más adelante)" % len(late)
+        entries.append(Entry(early[0].lineno, early[-1].end_lineno, label, 0, "import", True))
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+            e = Entry(_py_start(node), node.end_lineno,
+                      _py_node_label(node, lines, prefixes), 0, "decl")
+            entries.append(e)
+            if isinstance(node, ast.ClassDef) or e.size > BIG_BLOCK:
+                _py_children(node, lines, 1, opts, prefixes, entries)
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            size = node.end_lineno - node.lineno + 1
+            if size > CONST_MIN or opts["todo"]:
+                targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+                names = ", ".join(squash(_unparse(t)) for t in targets)
+                first = lines[node.lineno - 1]
+                rhs = first.split("=", 1)[1].strip() if "=" in first else ""
+                label = "%s = %s" % (names, clip(rhs, 50)) if rhs else names
+                entries.append(Entry(node.lineno, node.end_lineno, label, 0, "decl"))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        elif (isinstance(node, ast.Expr) and isinstance(getattr(node, "value", None), ast.Constant)
+              and isinstance(node.value.value, str)):
+            continue
+        else:
+            size = node.end_lineno - node.lineno + 1
+            if size >= opts["min"] or opts["todo"]:
+                entries.append(Entry(node.lineno, node.end_lineno,
+                                     _py_first_line(lines, node.lineno), 0, "decl"))
+    return py_header(text, tree), entries, None
+
+
+def outline_python_fallback(lines, opts):
+    """Por si el ast de este Python no entiende el fichero (sintaxis más nueva)."""
+    starts = []
+    for i, ln in enumerate(lines):
+        if ln and not ln[0].isspace() and not ln.startswith(("#", ")", "]", "}", '"""', "'''")):
+            starts.append(i)
+    entries = []
+    for k, s in enumerate(starts):
+        e = (starts[k + 1] - 1) if k + 1 < len(starts) else len(lines) - 1
+        while e > s and (not lines[e].strip() or lines[e].lstrip().startswith("#")):
+            e -= 1
+        first = lines[s].strip()
+        if first.startswith("@"):
+            continue
+        # arrastra decoradores inmediatamente anteriores
+        s0 = s
+        while s0 > 0 and lines[s0 - 1].startswith("@"):
+            s0 -= 1
+        if re.match(r"(async\s+def|def|class)\b", first) or (e - s + 1) > CONST_MIN:
+            entries.append(Entry(s0 + 1, e + 1, clip(first.rstrip(":"), 90), 0, "decl"))
+    return entries
+
+
+# --------------------------------------------------------------------------
+# TypeScript / TSX / JS
+# --------------------------------------------------------------------------
+
+_REGEX_PREV = set("(,=:[!&|?{};+-*%~^")
+_REGEX_KW = re.compile(r"(?:^|[^\w$])(return|typeof|case|do|else|in|of|yield|await|void|"
+                       r"delete|throw|new|instanceof)\s*$")
+
+
+def ts_line_states(text):
+    """Por línea: estado al empezar ('code', 'block' dentro de /* */, 'tmpl'
+    dentro del texto de un template literal) y profundidad de llaves {}.
+
+    Las comillas simples y dobles no cruzan líneas, así que un apóstrofo en el
+    texto de la JSX solo afecta a su línea; además un ' pegado a una letra
+    (don't) se toma por apóstrofo. Solo se cuentan llaves, no paréntesis: el
+    texto de la JSX puede llevar un ")" suelto, pero nunca una llave suelta."""
+    n = len(text)
+    states = ["code"]
+    curly = [0]
+    depth = 0
+    stack = [["code", 0]]     # marcos: ['code', llaves] | ['tmpl', 0]
+    sub = None                # None | 'line' | 'block' | 'sq' | 'dq'
+    line_start = 0
+    last_sig = ""
+    i = 0
+    while i < n:
+        c = text[i]
+        if c == "\n":
+            if sub in ("line", "sq", "dq"):
+                sub = None
+            if sub == "block":
+                states.append("block")
+            elif stack[-1][0] == "tmpl":
+                states.append("tmpl")
+            else:
+                states.append("code")
+            curly.append(depth)
+            i += 1
+            line_start = i
+            continue
+        top = stack[-1]
+        if top[0] == "tmpl":
+            if c == "\\":
+                i += 2
+                continue
+            if c == "`":
+                stack.pop()
+                last_sig = "`"
+                i += 1
+                continue
+            if c == "$" and i + 1 < n and text[i + 1] == "{":
+                stack.append(["code", 0])
+                depth += 1
+                i += 2
+                continue
+            i += 1
+            continue
+        # marco de código
+        if sub == "line":
+            i += 1
+            continue
+        if sub == "block":
+            if c == "*" and i + 1 < n and text[i + 1] == "/":
+                sub = None
+                i += 2
+                continue
+            i += 1
+            continue
+        if sub in ("sq", "dq"):
+            if c == "\\":
+                i += 2
+                continue
+            if (sub == "sq" and c == "'") or (sub == "dq" and c == '"'):
+                sub = None
+                last_sig = c
+            i += 1
+            continue
+        # código de verdad
+        if c == "/" and i + 1 < n and text[i + 1] == "/":
+            sub = "line"
+            i += 2
+            continue
+        if c == "/" and i + 1 < n and text[i + 1] == "*":
+            sub = "block"
+            i += 2
+            continue
+        if c == "'":
+            if i > 0 and (text[i - 1].isalpha()):
+                i += 1      # apóstrofo en texto de JSX: don't, it's
+                continue
+            sub = "sq"
+            i += 1
+            continue
+        if c == '"':
+            sub = "dq"
+            i += 1
+            continue
+        if c == "`":
+            stack.append(["tmpl", 0])
+            i += 1
+            continue
+        if c == "/":
+            before = text[line_start:i].rstrip()
+            prev = before[-1:] if before else last_sig
+            if prev in _REGEX_PREV or (before and _REGEX_KW.search(before)) or prev == "":
+                j = _regex_end(text, i)
+                if j is not None:
+                    i = j
+                    last_sig = "/"
+                    continue
+        if c == "{":
+            top[1] += 1
+            depth += 1
+        elif c == "}":
+            depth = max(0, depth - 1)
+            if top[1] == 0 and len(stack) > 1 and stack[-2][0] == "tmpl":
+                stack.pop()
+                i += 1
+                continue
+            top[1] = max(0, top[1] - 1)
+        if not c.isspace():
+            last_sig = c
+        i += 1
+    return states, curly
+
+
+def _regex_end(text, i):
+    """Fin de un literal /regex/flags que empieza en i, en la misma línea; o None."""
+    n = len(text)
+    j = i + 1
+    in_class = False
+    while j < n:
+        c = text[j]
+        if c == "\n":
+            return None
+        if c == "\\":
+            j += 2
+            continue
+        if in_class:
+            if c == "]":
+                in_class = False
+        elif c == "[":
+            in_class = True
+        elif c == "/":
+            j += 1
+            while j < n and (text[j].isalpha()):
+                j += 1
+            return j
+        j += 1
+    return None
+
+
+class TsFile(object):
+    def __init__(self, text):
+        self.text = text
+        self.lines = text.split("\n")
+        if self.lines and self.lines[-1] == "":
+            self.lines.pop()
+        states, curly = ts_line_states(text)
+        self.states = states[: len(self.lines)]
+        self.curly = curly[: len(self.lines)]
+        while len(self.states) < len(self.lines):
+            self.states.append("code")
+            self.curly.append(0)
+
+    def is_comment(self, i):
+        s = self.lines[i].strip()
+        return self.states[i] == "block" or s.startswith(("//", "/*"))
+
+    def is_blank(self, i):
+        return not self.lines[i].strip()
+
+
+_CONT_START = re.compile(r"(else|catch|finally|as|satisfies|extends|implements|keyof|typeof)\b")
+
+
+def ts_stmt_starts(f, lo, hi, indent, curly=None):
+    """Líneas [lo, hi) (0-based) que empiezan una sentencia con esa sangría
+    (y, si se da, con esa profundidad de llaves: una línea mal sangrada dentro
+    de un objeto no parte el bloque)."""
+    out = []
+    for i in range(lo, hi):
+        if f.states[i] != "code":
+            continue
+        if curly is not None and f.curly[i] != curly:
+            continue
+        line = f.lines[i]
+        s = line.strip()
+        if not s or indent_of(line) != indent:
+            continue
+        if s.startswith(("//", "/*", "*")):
+            continue
+        if s[0] in "})].?:,|&+-*/<>=" or _CONT_START.match(s):
+            continue
+        out.append(i)
+    return out
+
+
+def ts_segments(f, lo, hi, indent, curly=None):
+    """[(ini, fin)] 0-based: cada sentencia llega hasta la línea anterior a la
+    siguiente, quitando blancos y los comentarios que ya son de la siguiente."""
+    starts = ts_stmt_starts(f, lo, hi, indent, curly)
+    segs = []
+    for k, s in enumerate(starts):
+        e = starts[k + 1] - 1 if k + 1 < len(starts) else hi - 1
+        e = _trim_tail(f, s, e, indent)
+        segs.append((s, e))
+    return segs
+
+
+def _trim_tail(f, s, e, indent):
+    while e > s:
+        if f.is_blank(e):
+            e -= 1
+            continue
+        st = f.lines[e].strip()
+        if f.states[e] == "block" and st.endswith("*/"):
+            k = e
+            while k > s and f.states[k] == "block":
+                k -= 1
+            # k es la línea que abre el comentario
+            if k > s and indent_of(f.lines[k]) <= indent and f.lines[k].strip().startswith("/*"):
+                e = k - 1
+                continue
+            break
+        if st.startswith("/*") and st.endswith("*/") and indent_of(f.lines[e]) <= indent:
+            e -= 1
+            continue
+        if st.startswith("//") and indent_of(f.lines[e]) <= indent:
+            e -= 1
+            continue
+        break
+    return e
+
+
+_TS_DECL = re.compile(
+    r"^(?:export\s+)?(?:default\s+)?(?:declare\s+)?(?:async\s+)?"
+    r"(function\*?|const|let|var|class|abstract\s+class|interface|type|enum|namespace|module)\b")
+_TS_TESTISH = re.compile(r"^(describe|it|test|beforeEach|afterEach|beforeAll|afterAll|"
+                         r"vi\.mock|jest\.mock)(\.\w+)*\s*\(")
+
+
+def _code_part(line):
+    """La línea sin el comentario // del final (aproximado)."""
+    out, q = [], None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if q:
+            out.append(c)
+            if c == "\\":
+                if i + 1 < len(line):
+                    out.append(line[i + 1])
+                i += 2
+                continue
+            if c == q:
+                q = None
+        else:
+            if c in "'\"`" and not (c == "'" and i > 0 and line[i - 1].isalpha()):
+                q = c
+            elif c == "/" and line[i + 1:i + 2] == "/":
+                break
+            out.append(c)
+        i += 1
+    return "".join(out).rstrip()
+
+
+def _body_open(f, s, e):
+    """Línea (0-based) donde abre el cuerpo del bloque, o None."""
+    for j in range(s, min(e, s + 40) + 1):
+        if f.states[j] != "code":
+            continue
+        code = _code_part(f.lines[j])
+        if not code:
+            continue
+        if code.endswith("{"):
+            prev = code[:-1].rstrip()[-1:]
+            if prev and prev in "(,<|&:":
+                continue      # desestructuración o tipo literal, no el cuerpo
+            return j
+        if code.endswith("[") and re.search(r"=\s*\[$", code):
+            return j
+        if re.search(r"=>\s*\($", code) or code.endswith("return ("):
+            return j
+    return None
+
+
+def _ts_signature(f, s, e):
+    """La cabecera de una declaración: sus primeras líneas hasta cerrar los
+    paréntesis o abrir el cuerpo, en una sola línea."""
+    first = _code_part(f.lines[s]).strip()
+    if re.match(r"return\s*\($", first):
+        return "return ( …JSX… )"
+    parts = []
+    depth = 0
+    for j in range(s, min(e, s + 8) + 1):
+        if f.states[j] == "block":
+            continue
+        code = re.sub(r"/\*.*?\*/", "", _code_part(f.lines[j])).strip()
+        if not code or code.startswith(("/*", "*")):
+            continue
+        parts.append(code)
+        depth += code.count("(") - code.count(")")
+        if j == s and code.endswith("="):
+            continue
+        if depth <= 0 or code.endswith("=>"):
+            break
+        if code.endswith("{") and code[:-1].rstrip()[-1:] not in ("(", ",", "<", "|", "&", ":", ""):
+            break
+    sig = squash(" ".join(parts))
+    sig = re.sub(r"([(\[])\s+", r"\1", sig)
+    sig = re.sub(r",?\s+([)\]])", r"\1", sig)
+    sig = re.sub(r"\s*\{$", "", sig)
+    return sig
+
+
+def _hook_label(f, s, e):
+    first = f.lines[s].strip()
+    m = re.match(r"(useEffect|useLayoutEffect|useInsertionEffect)\s*\(", first)
+    if not m:
+        return None
+    deps = None
+    for j in range(e, max(s, e - 3) - 1, -1):
+        mm = re.search(r"\[(.*)\]\s*\)\s*;?\s*$", f.lines[j])
+        if mm and f.lines[j].strip().startswith(("}", ")", "[")):
+            deps = mm.group(1).strip()
+            break
+    label = m.group(1)
+    if deps is not None:
+        label += " [%s]" % clip(deps, 70)
+    return label
+
+
+def _child_label(f, s, e):
+    hook = _hook_label(f, s, e)
+    if hook:
+        return hook
+    sig = _ts_signature(f, s, e)
+    return sig
+
+
+def _jsx_titles(f, s, e, depth):
+    """Comentarios {/* ... */} al principio de línea dentro de [s, e] (0-based)."""
+    found = []
+    for j in range(s, e + 1):
+        st = f.lines[j].strip()
+        if not st.startswith("{/*"):
+            continue
+        txt = st[3:]
+        k = j
+        while "*/" not in txt and len(squash(txt)) < JSX_TITLE and k + 1 <= e:
+            k += 1
+            txt += " " + f.lines[k].strip()
+        txt = squash(txt.split("*/")[0].lstrip("*"))
+        txt = txt.strip("-=─—_*~ ").strip()
+        if not txt:
+            continue
+        found.append((j, txt))
+    out = []
+    for idx, (j, txt) in enumerate(found):
+        nxt = found[idx + 1][0] - 1 if idx + 1 < len(found) else e
+        ent = Entry(j + 1, nxt + 1, "{/* %s */}" % clip(txt, JSX_TITLE), depth, "jsx")
+        out.append(ent)
+    return out
+
+
+def _expand_ts(f, s, e, depth, opts, out):
+    """Hijas directas de un bloque gordo [s, e] (0-based)."""
+    j = _body_open(f, s, e)
+    if j is None or j >= e:
+        return
+    lo, hi = j + 1, e  # la línea e es la que cierra
+    indent = None
+    for k in range(lo, hi):
+        if f.states[k] == "code" and not f.is_blank(k) and not f.is_comment(k):
+            indent = indent_of(f.lines[k])
+            break
+    if indent is None or indent <= indent_of(f.lines[s]):
+        return
+    for cs, ce in ts_segments(f, lo, hi, indent, f.curly[lo]):
+        size = ce - cs + 1
+        first = f.lines[cs].strip()
+        is_return = first.startswith("return (") or first.startswith("return <")
+        if not (opts["todo"] or size >= opts["min"] or (is_return and size > 1)):
+            continue
+        out.append(Entry(cs + 1, ce + 1, _child_label(f, cs, ce), depth, "child"))
+        titles = _jsx_titles(f, cs, ce, depth + 1)
+        if titles:
+            out.extend(titles)
+        elif size > BIG_BLOCK and depth < MAX_DEPTH:
+            _expand_ts(f, cs, ce, depth + 1, opts, out)
+
+
+def outline_ts(text, path, opts):
+    f = TsFile(text)
+    entries = []
+    segs = ts_segments(f, 0, len(f.lines), 0, 0)
+    imports = [(s, e) for s, e in segs if re.match(r"import\b", f.lines[s].strip())
+               and not re.match(r"import\s*\(", f.lines[s].strip())]
+    reexports = [(s, e) for s, e in segs
+                 if re.match(r"export\s+(\*|\{[^}]*\}\s*from|type\s+\{[^}]*\}\s*from)",
+                             f.lines[s].strip())]
+    if imports:
+        entries.append(Entry(imports[0][0] + 1, imports[-1][1] + 1,
+                             "imports (%d)" % len(imports), 0, "import", True))
+    if reexports:
+        entries.append(Entry(reexports[0][0] + 1, reexports[-1][1] + 1,
+                             "re-exports (%d)" % len(reexports), 0, "import", True))
+    skip = set(imports) | set(reexports)
+    for s, e in segs:
+        if (s, e) in skip:
+            continue
+        first = f.lines[s].strip()
+        size = e - s + 1
+        is_decl = bool(_TS_DECL.match(first)) or first.startswith("export default")
+        is_test = bool(_TS_TESTISH.match(first))
+        if not (is_decl or is_test or size >= opts["min"] or opts["todo"]):
+            continue
+        label = _ts_signature(f, s, e)
+        ent = Entry(s + 1, e + 1, label, 0, "decl")
+        entries.append(ent)
+        if size > BIG_BLOCK:
+            _expand_ts(f, s, e, 1, opts, entries)
+    return ts_header(text, path), entries, None
+
+
+# --------------------------------------------------------------------------
+# Markdown
+# --------------------------------------------------------------------------
+
+def outline_md(text, lines, opts):
+    heads = []
+    fence = None
+    for i, ln in enumerate(lines):
+        s = ln.strip()
+        m = re.match(r"^(```+|~~~+)", s)
+        if m:
+            if fence is None:
+                fence = m.group(1)[0] * 3
+            elif s.startswith(fence):
+                fence = None
+            continue
+        if fence:
+            continue
+        m = re.match(r"^(#{1,6})\s+(.*)$", ln)
+        if m:
+            heads.append((i, len(m.group(1)), m.group(2).strip().rstrip("#").strip()))
+    entries = []
+    for idx, (i, lvl, title) in enumerate(heads):
+        end = len(lines) - 1
+        for j, lv2, _ in heads[idx + 1:]:
+            if lv2 <= lvl:
+                end = j - 1
+                break
+        while end > i and not lines[end].strip():
+            end -= 1
+        entries.append(Entry(i + 1, end + 1, "#" * lvl + " " + title, lvl - 1, "section"))
+    return md_header(text), entries, None
+
+
+# --------------------------------------------------------------------------
+# Recorte y salida
+# --------------------------------------------------------------------------
+
+def fit(entries, budget, todo):
+    if todo or len(entries) <= budget:
+        return entries, 0
+    keep = list(entries)
+    hidden = 0
+    # primero las hijas (y los títulos de la JSX), de la más corta a la más larga
+    for kinds in (("child", "jsx", "method", "section"), ("decl",)):
+        cands = sorted([e for e in keep if e.kind in kinds and not e.pinned],
+                       key=lambda e: (e.size, -e.start))
+        drop = set()
+        for e in cands:
+            if len(keep) - len(drop) <= budget:
+                break
+            drop.add(id(e))
+        if drop:
+            hidden += len(drop)
+            keep = [e for e in keep if id(e) not in drop]
+        if len(keep) <= budget:
+            break
+    return keep, hidden
+
+
+def build(path, rel, opts):
+    text = read_text(path)
+    if text is None:
+        size = os.path.getsize(path)
+        return ["%s · binario · %d bytes" % (rel, size)]
+    lines = text.split("\n")
+    if lines and lines[-1] == "":
+        lines.pop()
+    ext = os.path.splitext(path)[1].lower()
+    note = None
+    if ext in PY_EXT:
+        header, entries, note = outline_python(text, lines, opts)
+    elif ext in TS_EXT:
+        header, entries, note = outline_ts(text, path, opts)
+    elif ext in MD_EXT:
+        header, entries, note = outline_md(text, lines, opts)
+    else:
+        header, entries = header_of(path, text), []
+    out = ["%s · %d líneas · ~%s tokens" % (rel, len(lines), fmt_tokens(tokens_of(text)))]
+    if header:
+        out.append(clip("» " + header, WIDTH))
+    if note:
+        out.append("(%s)" % note)
+    budget = MAX_OUT - len(out) - 1
+    shown, hidden = fit(entries, budget, opts["todo"])
+    out.extend(e.render() for e in shown)
+    if hidden:
+        out.append("… %d declaraciones más cortas ocultas; --todo para verlas" % hidden)
+    return out
+
+
+def parse_args(argv):
+    opts = {"todo": False, "min": DEFAULT_MIN, "files": []}
+    it = iter(range(len(argv)))
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            sys.exit(0)
+        elif a == "--todo":
+            opts["todo"] = True
+        elif a == "--min" or a.startswith("--min="):
+            val = a.split("=", 1)[1] if "=" in a else (argv[i + 1] if i + 1 < len(argv) else "")
+            if "=" not in a:
+                i += 1
+            try:
+                opts["min"] = max(1, int(val))
+            except ValueError:
+                sys.stderr.write("sp-outline: --min necesita un número\n")
+                sys.exit(2)
+        elif a.startswith("-") and a != "-":
+            sys.stderr.write("sp-outline: opción desconocida %s\n" % a)
+            sys.exit(2)
+        else:
+            opts["files"].append(a)
+        i += 1
+    del it
+    return opts
+
+
+def main(argv=None):
+    opts = parse_args(sys.argv[1:] if argv is None else argv)
+    if not opts["files"]:
+        sys.stderr.write("uso: sp-outline <fichero> [--todo] [--min N]\n")
+        return 2
+    root = repo_root()
+    status = 0
+    for n, arg in enumerate(opts["files"]):
+        path = resolve(arg, root)
+        if path is None:
+            sys.stderr.write("sp-outline: no existe el fichero: %s\n" % arg)
+            status = 2
+            continue
+        if os.path.isdir(path):
+            sys.stderr.write("sp-outline: %s es una carpeta; usa sp-mapa %s\n" % (arg, arg))
+            status = 2
+            continue
+        if n:
+            print("")
+        print("\n".join(build(path, display_path(path, root), opts)))
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except BrokenPipeError:
+        sys.exit(0)

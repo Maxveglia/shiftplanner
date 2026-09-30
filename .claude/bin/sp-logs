@@ -1,0 +1,246 @@
+#!/usr/bin/env python3
+"""sp-logs: los logs de producción de ShiftPlanner resumidos, con el crudo en un fichero.
+
+`railway logs` sin `--lines` se queda en streaming y, con `--lines 1000`, vuelca
+mil líneas en el contexto para buscar tres errores. Este script baja los logs en
+JSON a un fichero, imprime un resumen de ~40 líneas (errores agrupados por
+plantilla, rutas lentas, despliegues) y da la ruta del crudo para `grep`.
+
+Solo lectura: no escribe en producción ni toca el servicio. Lanza `railway`
+desde ~/conductor/repos/manager-opt, que es la carpeta vinculada al proyecto.
+
+Uso:
+  sp-logs [app]     [--since 2h] [--lines 1000] [--filter '@level:error']
+  sp-logs http      [--since 1h] [--lines 3000] [--filter '@httpStatus:>=400']
+  sp-logs build     [--lines 300] [DEPLOYMENT_ID]
+  sp-logs deploys   [--limit 10]
+Horas en UTC. El crudo queda en <BASE>/.git/sp-logs/railway/.
+"""
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import time
+from collections import Counter, defaultdict
+
+BASE = os.path.expanduser("~/conductor/repos/manager-opt")
+SERVICIO = "shiftplanner"
+
+
+def railway(args, salida):
+    os.makedirs(os.path.dirname(salida), exist_ok=True)
+    with open(salida, "w", encoding="utf-8") as f:
+        r = subprocess.run(["railway", *args], cwd=BASE, stdout=f, stderr=subprocess.PIPE, text=True, timeout=180)
+    if r.returncode != 0:
+        print(f"railway {' '.join(args)} falló (código {r.returncode}):")
+        print("\n".join(r.stderr.strip().splitlines()[:6]))
+        sys.exit(2)
+
+
+def leer_jsonl(ruta):
+    filas = []
+    with open(ruta, encoding="utf-8", errors="replace") as f:
+        for linea in f:
+            linea = linea.strip()
+            if not linea:
+                continue
+            try:
+                filas.append(json.loads(linea))
+            except ValueError:
+                filas.append({"message": linea, "level": "?"})
+    return filas
+
+
+def hhmm(ts):
+    return (ts or "")[5:16].replace("T", " ")
+
+
+PATRONES = [
+    (re.compile(r"[\w.+-]+@[\w-]+\.[\w.]+"), "<email>"),
+    (re.compile(r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I), "<uuid>"),
+    (re.compile(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(:\d{2}(\.\d+)?)?(Z|[+-]\d{2}:?\d{2})?"), "<fecha>"),
+    (re.compile(r"\b[0-9a-f]{12,}\b", re.I), "<hex>"),
+    (re.compile(r"\b\d+(\.\d+)?\b"), "<n>"),
+    (re.compile(r"'[^']{0,80}'"), "'…'"),
+]
+
+
+def plantilla(msg):
+    for rx, rep in PATRONES:
+        msg = rx.sub(rep, msg)
+    return msg.strip()[:170]
+
+
+def nivel(fila):
+    """El nivel de verdad. Railway marca «error» todo lo que sale por stderr, y
+    uvicorn y alembic escriben ahí sus INFO: fiarse de `level` inventa errores."""
+    msg = (fila.get("message") or "").lstrip()
+    if re.match(r"(INFO|DEBUG)\b", msg):
+        return "info"
+    if re.match(r"(WARN|WARNING)\b", msg) or re.search(r"\bWARNING\b", msg[:60]):
+        return "warn"
+    if re.search(r"Traceback|\b\w*(Error|Exception)\b|CRITICAL|ERROR", msg):
+        return "error"
+    if msg.startswith(("File \"", "raise ", "^")):
+        return "error"  # cuerpo de un traceback
+    return "info"
+
+
+def es_problema(fila):
+    return nivel(fila) != "info"
+
+
+def cabecera(tipo, filas, ruta):
+    ts = sorted(f.get("timestamp") or "" for f in filas if f.get("timestamp"))
+    rango = f"{hhmm(ts[0])} → {hhmm(ts[-1])} UTC" if ts else "sin fechas"
+    print(f"sp-logs {tipo} · {len(filas)} líneas · {rango}")
+    print(f"Crudo: {ruta}  (grep -n '<texto>' en vez de leerlo entero)")
+    if tipo != "build":
+        print("Ojo: Railway da los logs del despliegue ACTUAL; para uno anterior, pasa su id (sp-logs deploys).")
+    if not filas:
+        print("Sin líneas en esa ventana: amplía --since o pasa el id del despliegue anterior.")
+
+
+def resumen_app(filas, ruta):
+    cabecera("app", filas, ruta)
+    niveles = Counter(nivel(f) for f in filas)
+    print("Niveles: " + " · ".join(f"{k} {v}" for k, v in niveles.most_common()))
+    grupos = defaultdict(list)
+    for f in filas:
+        if es_problema(f):
+            grupos[(nivel(f), plantilla(f.get("message") or ""))].append(f)
+    if not grupos:
+        print("Errores y avisos: ninguno.")
+    else:
+        print(f"Errores y avisos ({sum(len(v) for v in grupos.values())} en {len(grupos)} plantillas):")
+        for (niv, _), fs in sorted(grupos.items(), key=lambda kv: -len(kv[1]))[:14]:
+            ej = (fs[-1].get("message") or "").replace("\n", " ⏎ ")
+            ej = PATRONES[0][0].sub("<email>", ej)[:180]
+            print(f"  {len(fs):>4}× {niv:<5} {hhmm(fs[0].get('timestamp'))}–{hhmm(fs[-1].get('timestamp'))[6:]}  {ej}")
+        if len(grupos) > 14:
+            print(f"  … y {len(grupos) - 14} plantillas más")
+    ruido = Counter(plantilla(f.get("message") or "") for f in filas if not es_problema(f))
+    if ruido:
+        print("Lo más repetido (info):")
+        for t, n in ruido.most_common(5):
+            print(f"  {n:>4}× {t[:150]}")
+
+
+def ruta_plantilla(p):
+    p = (p or "").split("?")[0]
+    p = re.sub(r"/[0-9a-f]{8}-[0-9a-f-]{27}", "/{id}", p, flags=re.I)
+    p = re.sub(r"/\d{4}-\d{2}(-\d{2})?", "/{fecha}", p)
+    return re.sub(r"/\d+", "/{n}", p)
+
+
+def pct(vals, q):
+    if not vals:
+        return 0
+    s = sorted(vals)
+    return s[min(len(s) - 1, int(round(q * (len(s) - 1))))]
+
+
+def resumen_http(filas, ruta):
+    cabecera("http", filas, ruta)
+    estados = Counter()
+    for f in filas:
+        s = int(f.get("httpStatus") or 0)
+        estados["499" if s == 499 else f"{s // 100}xx"] += 1
+    print("Estados: " + " · ".join(f"{k} {v}" for k, v in sorted(estados.items())))
+    por_ruta = defaultdict(list)
+    for f in filas:
+        if (f.get("path") or "").startswith("/health"):
+            continue
+        por_ruta[f"{f.get('method', '?')} {ruta_plantilla(f.get('path'))}"].append(f)
+    def fila(k, fs):
+        d = [int(x.get("totalDuration") or 0) for x in fs]
+        err = sum(1 for x in fs if int(x.get("httpStatus") or 0) >= 400)
+        return f"  {len(fs):>5}  p50 {pct(d, .5):>6} ms  p95 {pct(d, .95):>6} ms  máx {max(d):>6} ms  err {err:>3}  {k[:70]}"
+    if not por_ruta:
+        return
+    print("Más pedidas (sin /health):")
+    for k, fs in sorted(por_ruta.items(), key=lambda kv: -len(kv[1]))[:10]:
+        print(fila(k, fs))
+    print("Más lentas (p95):")
+    for k, fs in sorted(por_ruta.items(), key=lambda kv: -pct([int(x.get("totalDuration") or 0) for x in kv[1]], .95))[:6]:
+        print(fila(k, fs))
+    malas = [f for f in filas if int(f.get("httpStatus") or 0) >= 500 or int(f.get("httpStatus") or 0) == 499]
+    if malas:
+        print(f"5xx y 499 ({len(malas)}; los 10 últimos):")
+        for f in malas[-10:]:
+            print(f"  {hhmm(f.get('timestamp'))}  {f.get('httpStatus')}  {int(f.get('totalDuration') or 0):>6} ms  {f.get('method')} {ruta_plantilla(f.get('path'))[:70]}")
+
+
+def resumen_build(filas, ruta):
+    cabecera("build", filas, ruta)
+    errores = [f for f in filas if es_problema(f)]
+    if errores:
+        print(f"Líneas con error ({len(errores)}; las 12 últimas):")
+        for f in errores[-12:]:
+            print("  " + (f.get("message") or "")[:200])
+    print("Final del build:")
+    for f in filas[-15:]:
+        print("  " + (f.get("message") or "")[:200])
+
+
+def resumen_deploys(ruta):
+    with open(ruta, encoding="utf-8") as f:
+        datos = json.load(f)
+    print(f"sp-logs deploys · {len(datos)} · crudo: {ruta}")
+    for d in datos:
+        meta = d.get("meta") or {}
+        quien = "manual (" + meta["cliCaller"] + ")" if meta.get("cliCaller") else (meta.get("commitHash") or "")[:7]
+        msg = (meta.get("commitMessage") or "").splitlines()[0][:60] if meta.get("commitMessage") else ""
+        print(f"  {hhmm(d.get('createdAt'))}  {d.get('status', '?'):<9} {str(d.get('id'))[:8]}  {quien:<8} {msg}")
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="sp-logs", description=__doc__.split("\n\n")[0])
+    ap.add_argument("tipo", nargs="?", default="app", choices=["app", "http", "build", "deploys"])
+    ap.add_argument("deployment", nargs="?", help="id de despliegue (por defecto, el actual)")
+    ap.add_argument("--since", help="p. ej. 30m, 2h, 1d")
+    ap.add_argument("--lines", type=int)
+    ap.add_argument("--filter", help="sintaxis de filtro de Railway")
+    ap.add_argument("--limit", type=int, default=10, help="deploys: cuántos")
+    a = ap.parse_intermixed_args()
+
+    if not os.path.isdir(os.path.join(BASE, ".git")):
+        print(f"No encuentro {BASE}: es la carpeta vinculada a Railway.")
+        sys.exit(2)
+    carpeta = os.path.join(BASE, ".git", "sp-logs", "railway")
+    ruta = os.path.join(carpeta, f"{a.tipo}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl")
+    ahora = time.time()
+    if os.path.isdir(carpeta):
+        for n in os.listdir(carpeta):
+            p = os.path.join(carpeta, n)
+            if ahora - os.path.getmtime(p) > 3 * 86400:
+                os.remove(p)
+
+    if a.tipo == "deploys":
+        ruta = ruta[:-1]  # .json
+        railway(["deployment", "list", "--service", SERVICIO, "--json", "--limit", str(a.limit)], ruta)
+        return resumen_deploys(ruta)
+
+    args = ["logs", "--service", SERVICIO, "--json"]
+    if a.tipo == "http":
+        args += ["--http", "--since", a.since or "1h", "--lines", str(a.lines or 3000)]
+    elif a.tipo == "build":
+        args += ["--build", "--lines", str(a.lines or 300)]
+    else:
+        args += ["--lines", str(a.lines or 1000)]
+        if a.since:
+            args += ["--since", a.since]
+    if a.filter:
+        args += ["--filter", a.filter]
+    if a.deployment:
+        args.append(a.deployment)
+    railway(args, ruta)
+    filas = leer_jsonl(ruta)
+    {"app": resumen_app, "http": resumen_http, "build": resumen_build}[a.tipo](filas, ruta)
+
+
+if __name__ == "__main__":
+    main()

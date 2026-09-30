@@ -1,0 +1,18 @@
+node_modules/
+**/node_modules/
+.venv/
+**/.venv/
+dist/
+**/dist/
+__pycache__/
+**/__pycache__/
+.context/
+
+# Local secrets. `.dockerignore` already keeps these out of the image, but
+# without this they still travel to the builder in the upload.
+.env
+**/.env
+.env.*
+**/.env.*
+!.env.example
+!**/.env.example

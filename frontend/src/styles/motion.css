@@ -1,0 +1,163 @@
+/* ---------------------------------------------------------------------------
+   The motion kit: the launcher's language, spoken by the rest of the app.
+
+   Things arrive one after another and out of a blur; a click answers where it
+   landed; light follows the pointer; the brand's marks assemble from their
+   pieces. The launcher does it loudly, on a dark stage, once per sign-in. The
+   app does it quietly, on paper, all day -- so the same moves, smaller and
+   quicker, and never on anything a manager is dragging or typing into.
+
+   Rules every `.m-*` class keeps (and every area file next to this one):
+   - transform, opacity and filter only, so movement stays on the compositor;
+   - entrances use `backwards` fill, never `both`: when one ends, the element
+     is back on its ordinary rules and hover can take over;
+   - a transform or filter on an ancestor becomes the frame of any
+     `position: fixed` inside it, which is why dialogs are portalled to
+     <body> and why nothing here holds a transform once it has arrived;
+   - everything stops under prefers-reduced-motion (block at the end).
+
+   Stagger with `--d` (a delay, from staggerDelay() in lib/motion/kit.ts). */
+
+/* --- Arriving ------------------------------------------------------------- */
+
+@keyframes m-rise {
+  from {
+    opacity: 0;
+    transform: translateY(12px);
+    filter: blur(6px);
+  }
+}
+.m-rise {
+  animation: m-rise 560ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+@keyframes m-fade {
+  from {
+    opacity: 0;
+  }
+}
+.m-fade {
+  animation: m-fade 400ms ease-out backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* Something that opens over the page: a dialog, a menu, a popover. */
+@keyframes m-pop {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.96);
+    filter: blur(4px);
+  }
+}
+.m-pop {
+  transform-origin: var(--origin, 50% 0%);
+  animation: m-pop 280ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* --- Answering a click ---------------------------------------------------- */
+
+/* Drawn in the control's own text colour, under its text: the control needs
+   `relative overflow-hidden isolate` (see useRipple). */
+@keyframes m-ripple {
+  from {
+    transform: scale(0);
+    opacity: 0.22;
+  }
+  to {
+    transform: scale(1);
+    opacity: 0;
+  }
+}
+.m-ripple {
+  position: absolute;
+  z-index: -1;
+  border-radius: 9999px;
+  background: currentColor;
+  pointer-events: none;
+  animation: m-ripple 650ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+
+/* A press you can feel: the control gives a little under the pointer. */
+.m-press {
+  transition-property: color, background-color, border-color, box-shadow, transform;
+  transition-duration: 180ms;
+  transition-timing-function: cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.m-press:not(:disabled):active {
+  transform: scale(0.965);
+}
+
+/* --- Light under the pointer ---------------------------------------------- */
+
+/* On a surface that tracks the pointer with trackPointerLight(). Painted as
+   the surface's own background image, over its background colour and under
+   everything in it -- and deliberately NOT as a pseudo-element: that needed
+   `position: relative` and `isolation: isolate` on every card, which moved
+   the containing block of whatever was absolutely positioned inside and gave
+   each card its own stacking context, so a tooltip could no longer rise over
+   the card next to it. The glow's colour is a registered property so it can
+   fade in and out; the gradient itself cannot be transitioned. */
+@property --m-glow {
+  syntax: '<color>';
+  inherits: false;
+  initial-value: rgb(14 124 102 / 0);
+}
+.m-light {
+  background-image: radial-gradient(
+    420px circle at var(--mx, 50%) var(--my, 50%),
+    var(--m-glow),
+    transparent 60%
+  );
+  transition: --m-glow 350ms ease;
+}
+.m-light:hover {
+  --m-glow: rgb(68 214 180 / 0.07);
+}
+
+/* --- The marks ------------------------------------------------------------ */
+
+/* Pieces of a mark (AnimatedMark) settling into place: quicker and closer
+   than the launcher's, because the sidebar's logo is 28px, not 112. Parted a
+   touch while the pointer is over whatever holds the mark (`.m-mark-host`). */
+@keyframes m-piece-in {
+  from {
+    opacity: 0;
+    transform: translate(calc(var(--dx) * 0.9px), calc(var(--dy) * 0.9px)) scale(0.5)
+      rotate(-30deg);
+  }
+}
+.m-piece {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: m-piece-in 700ms cubic-bezier(0.34, 1.56, 0.64, 1) backwards;
+  animation-delay: calc(120ms + var(--t, 0) * 100ms + var(--j) * 60ms);
+  transition: transform 450ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.m-mark-host:hover .m-piece,
+.m-mark-host:focus-visible .m-piece {
+  transform: translate(calc(var(--dx) * 0.1px), calc(var(--dy) * 0.1px));
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .m-rise,
+  .m-fade,
+  .m-pop,
+  .m-piece {
+    animation: none;
+  }
+  .m-press,
+  .m-piece,
+  .m-light {
+    transition: none;
+  }
+  .m-press:not(:disabled):active,
+  .m-mark-host:hover .m-piece,
+  .m-mark-host:focus-visible .m-piece {
+    transform: none;
+  }
+  .m-ripple {
+    display: none;
+  }
+}

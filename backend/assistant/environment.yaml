@@ -1,0 +1,23 @@
+# The container the business assistant's file tools run in. Created once:
+#
+#   ant beta:environments create < backend/assistant/environment.yaml --transform id -r
+#
+# and its id goes in ASSISTANT_ENVIRONMENT_ID. See agent.yaml.
+#
+# NO NETWORK. `limited` with nothing allowed: no hosts, no package managers,
+# no MCP servers. The agent's only built-in tools read and write files (the
+# mounted memory store and its own scratch space); everything it knows about
+# the business arrives as custom-tool results from our backend, which travel
+# over the session's event stream and never over this container's network.
+# So there is nothing for it to reach, and nothing it has read can be sent
+# anywhere from here. The memory mount is the platform's, not a network call
+# the agent makes, and works under `limited`.
+
+name: shiftplanner-assistant
+description: Sandbox for the ShiftPlanner business assistant. No network.
+config:
+  type: cloud
+  networking:
+    type: limited
+    allow_package_managers: false
+    allow_mcp_servers: false

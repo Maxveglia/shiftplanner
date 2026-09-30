@@ -1,0 +1,588 @@
+/* Figtree, the one family the design system uses, in its three weights.
+   Imported rather than self-hosted because nothing else in this build pipeline
+   handles fonts yet; `display=swap` so a slow font shows the fallback stack
+   instead of a blank rota. */
+@import url('https://fonts.googleapis.com/css2?family=Figtree:wght@400;500;600&display=swap');
+
+/* The app's motion: the shared kit, then one file per area so the sidebar,
+   the shared components and the calendar can each say their own without
+   crowding this one. */
+@import './styles/motion.css';
+@import './styles/motion-chrome.css';
+@import './styles/motion-components.css';
+@import './styles/motion-calendar.css';
+@import './styles/motion-auth.css';
+@import './styles/motion-screens.css';
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+/* The whole app is dark (tailwind.config.js): native controls -- date
+   pickers, selects, scrollbars, autofill -- are told so too, or they come up
+   white in the middle of it. */
+:root {
+  color-scheme: dark;
+}
+
+body {
+  @apply bg-ground text-gray-900 antialiased;
+}
+
+/* With `color-scheme: dark` the browser paints every field without a
+   background class in its own flat grey (#3b3b3b), which Tailwind's preflight
+   leaves alone -- a grey slab in the middle of the glass. Fields get a faint
+   glass of their own instead; any `bg-*` class still wins, being a utility.
+   Checked boxes and radios take the brand's menta instead of the system blue. */
+@layer base {
+  input:where(:not([type='checkbox']):not([type='radio']):not([type='range'])),
+  textarea,
+  select {
+    background-color: rgb(255 255 255 / 0.04);
+  }
+  input[type='checkbox'],
+  input[type='radio'] {
+    accent-color: #14a184;
+  }
+}
+
+/* Hours and totals line up in columns all over this product -- the week grid,
+   payroll, the working year. Proportional digits make those columns ragged. */
+.tabular,
+table {
+  font-variant-numeric: tabular-nums;
+}
+
+/* The interview chat. A message arrives rather than appears, and the dots
+   under it breathe while the next question is being thought of. */
+@keyframes chat-in {
+  from {
+    opacity: 0;
+    transform: translateY(6px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+.chat-in {
+  animation: chat-in 220ms ease-out both;
+}
+@keyframes chat-dot {
+  0%,
+  80%,
+  100% {
+    transform: translateY(0);
+    opacity: 0.4;
+  }
+  40% {
+    transform: translateY(-4px);
+    opacity: 1;
+  }
+}
+.chat-dot {
+  animation: chat-dot 1.2s ease-in-out infinite;
+}
+@keyframes mic-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.45);
+  }
+  100% {
+    box-shadow: 0 0 0 10px rgba(239, 68, 68, 0);
+  }
+}
+.mic-pulse {
+  animation: mic-pulse 1.1s ease-out infinite;
+}
+/* The calendar being drafted. While the AI arranges the shifts, blocks land
+   on a small week grid one after another, hold, and clear so the next pass
+   can draw them again -- a rota taking shape rather than a spinner. */
+@keyframes draft-block {
+  0% {
+    opacity: 0;
+    transform: scaleX(0.15);
+  }
+  6% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  84% {
+    opacity: 1;
+    transform: scaleX(1);
+  }
+  92%,
+  100% {
+    opacity: 0;
+    transform: scaleX(1);
+  }
+}
+/* Eight seconds a pass: the last block lands about three seconds in (see the
+   stagger in GenerationProgress), so the whole week is on screen for a few
+   seconds before it clears in the same order it was drawn. */
+.draft-block {
+  transform-origin: left center;
+  animation: draft-block 8s ease-out infinite both;
+}
+/* Opening a day out of the year, and the year arriving or coming back after
+   a day closes, used to be two keyframes here (dayIn, yearIn). They live in
+   styles/motion-calendar.css now, with the rest of the calendar's motion: the
+   day grows out of the circle that was pressed (DayView), the year's months
+   arrive one after another and settle when a day is closed (YearGrid). */
+
+/* A wait with no percentage to show. A slice of colour runs along the track
+   and comes back round, so the page is visibly alive without pretending to
+   know how far along it is. */
+@keyframes progress-sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(250%);
+  }
+}
+.progress-sweep {
+  animation: progress-sweep 1.6s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .chat-in,
+  .chat-dot,
+  .mic-pulse,
+  .draft-block,
+  .progress-sweep {
+    animation: none;
+  }
+  .draft-block {
+    opacity: 0.8;
+  }
+  /* Standing still, the sweep would read as 40 % done. */
+  .progress-track {
+    display: none;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   The launcher: where a manager lands after signing in and picks an app.
+
+   Everything here moves on transform, opacity and filter only, so the page
+   stays on the compositor however much of it is moving. Entrances use
+   `backwards` fill, never `both`: once an entrance ends its element goes back
+   to its ordinary rules, which is what lets hover and the exit transition
+   take over from it (a held final keyframe would outrank them).
+
+   Each tile sets `--accent` as bare RGB channels, so one rule can draw its
+   glow, ring and ripple in whichever app's colour it belongs to. */
+
+/* The page under the stage: an overscroll bounce (iOS) or a frame before the
+   stage paints shows the document's own ground, which is light grey. */
+html:has(.launcher),
+body:has(.launcher) {
+  background-color: #0b1512;
+}
+
+/* Behind the app's own screens the stage is the room, not the show: the
+   colour turned down so it glows round the cards instead of competing with
+   what is on them. */
+.app-stage .launcher-aurora {
+  opacity: 0.6;
+}
+/* ...and stands still. The launcher and the sign-in are seconds on screen and
+   earn their drift; the dashboard is open all day and the employee's screen
+   lives on a phone, where three screen-sized washes moving forever behind a
+   still page is battery spent on nothing. */
+.app-stage .launcher-blob {
+  animation: none;
+}
+
+.launcher {
+  /* Pointer position across the viewport, -1..1, set from the page. */
+  --px: 0;
+  --py: 0;
+  background: #0b1512;
+}
+
+/* Three slow washes of colour behind everything, leaning a little towards
+   the pointer. */
+.launcher-aurora {
+  transform: translate3d(calc(var(--px) * 28px), calc(var(--py) * 28px), 0);
+  transition: transform 900ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+/* Each wash is a disc of colour with its edge blurred over 90px, drawn as a
+   gradient rather than as `filter: blur(90px)`: Safari repainted those
+   filters, a texture the size of the screen each, whenever the page under
+   them changed -- the screen stood still for a second or more on every way
+   into an app. The gradient spills past the disc by the blur's reach on
+   every side (`--reach`), on a layer of its own so the disc's box -- which
+   the drift's percentages are of -- keeps its size, and the edge falls off
+   as a blur's does: half the colour on the disc's rim, all of it or none 2σ
+   either side. `--blob` is the colour's RGB channels. */
+.launcher-blob {
+  position: absolute;
+  opacity: 0.5;
+  animation: launcher-drift 20s ease-in-out infinite alternate;
+}
+.launcher-blob::before {
+  --reach: 180px;
+  content: '';
+  position: absolute;
+  inset: calc(-1 * var(--reach));
+  background: radial-gradient(
+    closest-side,
+    rgb(var(--blob)) calc(100% - 2 * var(--reach)),
+    rgb(var(--blob) / 0.84) calc(100% - 1.5 * var(--reach)),
+    rgb(var(--blob) / 0.5) calc(100% - var(--reach)),
+    rgb(var(--blob) / 0.16) calc(100% - 0.5 * var(--reach)),
+    rgb(var(--blob) / 0) 100%
+  );
+}
+@keyframes launcher-drift {
+  from {
+    transform: translate3d(-6%, -4%, 0) scale(1);
+  }
+  to {
+    transform: translate3d(8%, 6%, 0) scale(1.18);
+  }
+}
+
+/* A faint dot grid -- the rejilla the whole brand comes from -- fading out
+   towards the edges. */
+.launcher-grid {
+  background-image: radial-gradient(rgba(255, 255, 255, 0.08) 1px, transparent 1px);
+  background-size: 26px 26px;
+  -webkit-mask-image: radial-gradient(ellipse at 50% 45%, #000 20%, transparent 72%);
+  mask-image: radial-gradient(ellipse at 50% 45%, #000 20%, transparent 72%);
+}
+
+/* The launcher's own entrance runs quicker than the sign-in's, which shares
+   its letters and the pieces of its marks: it is opened after every sign-in
+   and from every app's logo, to be passed through in a second. `--tempo`
+   scales every delay and duration of an entrance; 1 is the sign-in's. */
+.launcher-home {
+  --tempo: 0.8;
+}
+
+/* The greeting, letter by letter, rising out of a blur. */
+.launcher-letter {
+  display: inline-block;
+  white-space: pre;
+  animation: launcher-letter calc(800ms * var(--tempo, 1)) cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: calc((120ms + var(--i) * 38ms) * var(--tempo, 1));
+}
+@keyframes launcher-letter {
+  from {
+    opacity: 0;
+    transform: translateY(0.45em) rotate(6deg);
+    filter: blur(10px);
+  }
+}
+
+/* Tiles arrive after the greeting, one after the other, then drift. With no
+   greeting to wait for (the launcher opened from inside an app, `data-quiet`)
+   the tiles start at once and rise quicker, and the pieces of their marks
+   start that much sooner: the manager clicked to get here, and the screen
+   answers the click. */
+.launcher[data-quiet] {
+  --hurry: 380ms;
+}
+.launcher[data-quiet] .launcher-tile-in {
+  animation-duration: calc(600ms * var(--tempo, 1));
+}
+.launcher-tile-in {
+  animation: launcher-rise calc(1000ms * var(--tempo, 1)) cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: calc((380ms - var(--hurry, 0ms) + var(--i) * 130ms) * var(--tempo, 1));
+  transition:
+    opacity 420ms cubic-bezier(0.4, 0, 0.2, 1),
+    transform 520ms cubic-bezier(0.4, 0, 0.2, 1),
+    filter 420ms ease;
+}
+@keyframes launcher-rise {
+  from {
+    opacity: 0;
+    transform: translateY(48px) scale(0.92);
+    filter: blur(12px);
+  }
+}
+.launcher-float {
+  animation: launcher-float 7s ease-in-out infinite;
+  animation-delay: calc(var(--i) * -3.5s);
+}
+@keyframes launcher-float {
+  0%,
+  100% {
+    transform: translateY(0);
+  }
+  50% {
+    transform: translateY(-7px);
+  }
+}
+
+.launcher-tile {
+  --rx: 0deg;
+  --ry: 0deg;
+  --mx: 50%;
+  --my: 50%;
+  --s: 1;
+  transform: perspective(1000px) rotateX(var(--rx)) rotateY(var(--ry)) scale(var(--s));
+  transform-style: preserve-3d;
+  transition:
+    transform 650ms cubic-bezier(0.2, 0.9, 0.25, 1),
+    border-color 400ms ease,
+    box-shadow 500ms ease,
+    background-color 400ms ease;
+  -webkit-tap-highlight-color: transparent;
+}
+/* While the pointer is on it the tile follows closely; letting go it eases
+   back on the slower curve above. */
+.launcher-tile[data-tracking] {
+  transition:
+    transform 140ms ease-out,
+    border-color 400ms ease,
+    box-shadow 500ms ease,
+    background-color 400ms ease;
+}
+.launcher-tile:hover,
+.launcher-tile:focus-visible {
+  --s: 1.025;
+  border-color: rgb(var(--accent) / 0.5);
+  background-color: rgb(255 255 255 / 0.07);
+  box-shadow:
+    0 40px 90px -30px rgb(var(--accent) / 0.55),
+    0 0 0 1px rgb(var(--accent) / 0.15);
+}
+.launcher-tile:focus-visible {
+  outline: 2px solid rgb(var(--accent));
+  outline-offset: 6px;
+}
+.launcher-tile:active {
+  --s: 0.965;
+}
+
+/* Light under the pointer. */
+.launcher-spot {
+  background: radial-gradient(
+    380px circle at var(--mx) var(--my),
+    rgb(var(--accent) / 0.2),
+    transparent 50%
+  );
+  opacity: 0;
+  transition: opacity 350ms ease;
+}
+.launcher-tile:hover .launcher-spot,
+.launcher-tile:focus-visible .launcher-spot {
+  opacity: 1;
+}
+
+/* A slice of the app's colour running round the edge. */
+@property --launcher-angle {
+  syntax: '<angle>';
+  initial-value: 0deg;
+  inherits: false;
+}
+.launcher-ring {
+  padding: 1.5px;
+  background: conic-gradient(
+    from var(--launcher-angle),
+    transparent 0 55%,
+    rgb(var(--accent) / 0.9) 78%,
+    transparent 100%
+  );
+  -webkit-mask:
+    linear-gradient(#000 0 0) content-box,
+    linear-gradient(#000 0 0);
+  -webkit-mask-composite: xor;
+  mask-composite: exclude;
+  opacity: 0;
+  transition: opacity 400ms ease;
+  animation: launcher-spin 3.2s linear infinite paused;
+}
+/* Turning only while it shows: an animated custom property is restyled and
+   repainted on the main thread every frame, seen or not, and that is the
+   thread the reveal needs. Paused rather than taken off, so it fades out
+   where it was instead of jumping back to the start, and so the reduced-
+   motion `animation: none` below still wins. The sign-in's card lights it
+   too (motion-auth.css). */
+.launcher-tile:hover .launcher-ring,
+.launcher-tile:focus-visible .launcher-ring {
+  opacity: 1;
+  animation-play-state: running;
+}
+/* Leaving, everything that moves forever holds still for the reveal. */
+.launcher[data-leaving] :is(.launcher-blob, .launcher-float, .launcher-ring) {
+  animation-play-state: paused;
+}
+@keyframes launcher-spin {
+  to {
+    --launcher-angle: 360deg;
+  }
+}
+
+/* The app icon floats above the card's plane and lifts further on hover. */
+.launcher-icon {
+  transform: translateZ(40px);
+  transition: transform 650ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.launcher-tile:hover .launcher-icon,
+.launcher-tile:focus-visible .launcher-icon {
+  transform: translateZ(70px) translateY(-6px) scale(1.06);
+}
+.launcher-icon-glow {
+  filter: blur(26px);
+  opacity: 0.55;
+  transform: translateY(14px) scale(0.85);
+  transition:
+    opacity 500ms ease,
+    transform 650ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.launcher-tile:hover .launcher-icon-glow,
+.launcher-tile:focus-visible .launcher-icon-glow {
+  opacity: 0.9;
+  transform: translateY(20px) scale(1);
+}
+.launcher-name {
+  transform: translateZ(24px);
+}
+
+/* The pieces of each mark fly in from their own direction and settle into
+   place, then part a little under the pointer -- the mark coming apart and
+   back together. `--dx`/`--dy` point from the mark's centre to the piece's,
+   in the 24-unit box. */
+.launcher-piece {
+  transform-box: fill-box;
+  transform-origin: center;
+  animation: launcher-piece-in calc(900ms * var(--tempo, 1)) cubic-bezier(0.34, 1.56, 0.64, 1)
+    backwards;
+  animation-delay: calc(
+    (650ms - var(--hurry, 0ms) + var(--t) * 130ms + var(--j) * 75ms) * var(--tempo, 1)
+  );
+  transition: transform 520ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+@keyframes launcher-piece-in {
+  from {
+    opacity: 0;
+    transform: translate(calc(var(--dx) * 1.5px), calc(var(--dy) * 1.5px)) scale(0.3)
+      rotate(-40deg);
+  }
+}
+.launcher-tile:hover .launcher-piece,
+.launcher-tile:focus-visible .launcher-piece {
+  transform: translate(calc(var(--dx) * 0.13px), calc(var(--dy) * 0.13px));
+}
+
+/* A click answers where it landed: a ripple inside a tile, a ring anywhere
+   else on the page. */
+.launcher-ripple {
+  position: absolute;
+  width: 24px;
+  height: 24px;
+  margin: -12px 0 0 -12px;
+  border-radius: 9999px;
+  background: rgb(var(--accent) / 0.4);
+  pointer-events: none;
+  animation: launcher-ripple 700ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+@keyframes launcher-ripple {
+  from {
+    transform: scale(0);
+    opacity: 1;
+  }
+  to {
+    transform: scale(32);
+    opacity: 0;
+  }
+}
+.launcher-burst {
+  position: fixed;
+  width: 14px;
+  height: 14px;
+  margin: -7px 0 0 -7px;
+  border-radius: 9999px;
+  border: 1.5px solid rgb(255 255 255 / 0.55);
+  pointer-events: none;
+  animation: launcher-burst 650ms cubic-bezier(0.2, 0.8, 0.2, 1) forwards;
+}
+@keyframes launcher-burst {
+  from {
+    transform: scale(0.2);
+    opacity: 1;
+  }
+  to {
+    transform: scale(5.5);
+    opacity: 0;
+  }
+}
+
+/* Leaving: the greeting lifts away, the tile not chosen falls back into the
+   blur, the chosen one swells -- then the reveal grows from it. */
+.launcher-title {
+  transition:
+    opacity 380ms ease,
+    transform 480ms cubic-bezier(0.4, 0, 0.2, 1),
+    filter 380ms ease;
+}
+.launcher[data-leaving] .launcher-title {
+  opacity: 0;
+  transform: translateY(-18px);
+  filter: blur(8px);
+}
+.launcher[data-leaving] .launcher-tile-in:not([data-chosen]) {
+  opacity: 0;
+  transform: translateY(24px) scale(0.88);
+  filter: blur(14px);
+}
+.launcher[data-leaving] [data-chosen] .launcher-tile {
+  --s: 1.07;
+}
+.launcher[data-leaving='logout'] .launcher-tile-in {
+  opacity: 0;
+  transform: scale(0.9);
+  filter: blur(14px);
+}
+
+/* The app, arriving out of the reveal's grey. Opacity only: a transform on
+   the layout, even a passing one, would make it the frame of every
+   `position: fixed` inside it, and a dialog opened in that half-second would
+   cover the page beside the sidebar instead of the window. */
+@keyframes launcher-arrive {
+  from {
+    opacity: 0;
+  }
+}
+.launcher-arrive {
+  animation: launcher-arrive 280ms ease-out backwards;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .launcher-aurora,
+  .launcher-tile,
+  .launcher-tile[data-tracking],
+  .launcher-icon,
+  .launcher-icon-glow,
+  .launcher-piece,
+  .launcher-title,
+  .launcher-tile-in {
+    transition: none;
+  }
+  .launcher-blob,
+  .launcher-letter,
+  .launcher-tile-in,
+  .launcher-float,
+  .launcher-ring,
+  .launcher-piece,
+  .launcher-arrive {
+    animation: none;
+  }
+  .launcher-tile:hover .launcher-piece,
+  .launcher-tile:focus-visible .launcher-piece {
+    transform: none;
+  }
+  .launcher-ripple,
+  .launcher-burst {
+    display: none;
+  }
+}

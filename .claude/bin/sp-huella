@@ -1,0 +1,110 @@
+#!/usr/bin/env bash
+# sp-huella · huella del código de ShiftPlanner tal y como está en DISCO.
+#
+# Imprime, por subárbol (backend, infra, frontend), el id del árbol git que
+# tendría ese subárbol si se hiciera ahora `git add -A`: incluye los cambios sin
+# commitear y los ficheros nuevos no ignorados, y respeta .gitignore. Dos estados
+# del código dan la misma huella si y solo si esos ficheros son idénticos (es un
+# objeto árbol de git: no depende de quién lo calcule, dentro de una versión).
+#
+# ÚNICA implementación: la usan sp-test (para dejar constancia de sobre qué código
+# corrió cada suite) y el hook verde-de-verdad (para saber si el código cambió).
+#
+# No toca el índice real ni el stash (que es común a todos los worktrees): copia
+# el índice del worktree a un temporal CONSERVANDO su mtime (cp -p: si no, git no
+# reconoce las entradas «racy» y una edición del mismo tamaño en el mismo segundo que
+# un `git status` pasa por no cambiada) y trabaja con GIT_INDEX_FILE. Si el índice
+# tiene entradas sin resolver (un rebase con conflicto), parte de `read-tree HEAD`.
+# Lo único que deja son objetos sueltos en .git/objects, que git gc limpia.
+#
+# Versión 2 (huella_v): no cuentan los artefactos de las suites aunque no estén en
+# .gitignore: .hypothesis, __pycache__, .pytest_cache, node_modules, coverage, dist.
+#
+# Uso: sp-huella [-C DIR] [--json]
+#   por defecto, una línea por subárbol («backend <id>», «-» si no existe) y «huella_v 2»;
+#   --json: {"huella_v": 2, "backend": "<id>", "infra": …, "frontend": null}
+# Código: 0 bien · 2 no es un repo git o git falló.
+# Escrito para el bash 3.2 de macOS y para Linux.
+
+set -u
+HUELLA_V=2
+SUBARBOLES="backend infra frontend"
+
+DIR="."
+JSON=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -C) [ $# -ge 2 ] || { echo "sp-huella: -C necesita una carpeta" >&2; exit 2; }; DIR=$2; shift ;;
+    -C?*) DIR=${1#-C} ;;
+    --json) JSON=1 ;;
+    -h|--help) sed -n '2,27p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "sp-huella: argumento desconocido: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+# Que nada del entorno de quien llama (un hook de git, otra herramienta) cambie de repo o de índice.
+unset GIT_DIR GIT_WORK_TREE GIT_INDEX_FILE GIT_COMMON_DIR GIT_PREFIX GIT_OBJECT_DIRECTORY 2>/dev/null
+
+top=$(git -C "$DIR" rev-parse --show-toplevel 2>/dev/null) || { echo "sp-huella: $DIR no es un repo git" >&2; exit 2; }
+idx=$(git -C "$top" rev-parse --git-path index 2>/dev/null) || exit 2
+case "$idx" in /*) ;; *) idx="$top/$idx" ;; esac
+
+tmp=$(mktemp "${TMPDIR:-/tmp}/sp-huella.XXXXXX") || exit 2
+trap 'rm -f "$tmp" "$tmp.lock"' EXIT
+
+# Solo los subárboles que existen en disco o en el índice (un pathspec que no casa hace
+# fallar a git add), y sin los artefactos de las suites.
+rutas() {
+  set --
+  for d in $SUBARBOLES; do
+    if [ -e "$top/$d" ] || GIT_INDEX_FILE="$tmp" git -C "$top" ls-files --error-unmatch -- "$d" >/dev/null 2>&1; then
+      set -- "$@" "$d"
+    fi
+  done
+  [ $# -gt 0 ] || return 0
+  printf '%s\n' "$@" \
+    ':(exclude,glob)**/.hypothesis/**' ':(exclude,glob)**/__pycache__/**' \
+    ':(exclude,glob)**/.pytest_cache/**' ':(exclude,glob)**/node_modules/**' \
+    ':(exclude,glob)**/coverage/**' ':(exclude,glob)**/dist/**'
+}
+
+# $1 = copia | head. Deja en $arbol el árbol del índice temporal tras `add -A`.
+arbol_de() {
+  rm -f "$tmp" "$tmp.lock"
+  if [ "$1" = copia ]; then
+    if [ -f "$idx" ]; then cp -p "$idx" "$tmp" || return 2; fi   # sin índice: que git lo cree
+  else
+    GIT_INDEX_FILE="$tmp" git -C "$top" read-tree HEAD >/dev/null 2>&1 || rm -f "$tmp"
+  fi
+  lista=$(rutas)
+  if [ -n "$lista" ]; then
+    # Bash 3.2: sin mapfile. Las rutas no llevan saltos de línea (son fijas).
+    old_ifs=$IFS; IFS='
+'
+    # shellcheck disable=SC2086
+    GIT_INDEX_FILE="$tmp" git -C "$top" add -A -- $lista >/dev/null 2>&1 || { IFS=$old_ifs; return 2; }
+    IFS=$old_ifs
+  fi
+  arbol=$(GIT_INDEX_FILE="$tmp" git -C "$top" write-tree 2>/dev/null)
+}
+
+arbol=""
+set -f  # los pathspecs llevan '*': que la shell no los expanda
+arbol_de copia || arbol_de head || { echo "sp-huella: no pude calcular el árbol de $top" >&2; exit 2; }
+set +f
+# "040000 tree <id>\tbackend" por cada subárbol presente, en una sola llamada.
+lista=$(git -C "$top" ls-tree "$arbol" -- $SUBARBOLES 2>/dev/null) || exit 2
+
+sep=", "
+if [ "$JSON" = 1 ]; then printf '{"huella_v": %d' "$HUELLA_V"; fi
+for d in $SUBARBOLES; do
+  id=$(printf '%s\n' "$lista" | awk -v d="$d" -F'\t' '$2 == d { split($1, c, " "); if (c[2] == "tree") print c[3] }')
+  if [ "$JSON" = 1 ]; then
+    if [ -n "$id" ]; then printf '%s"%s": "%s"' "$sep" "$d" "$id"; else printf '%s"%s": null' "$sep" "$d"; fi
+  else
+    printf '%s %s\n' "$d" "${id:--}"
+  fi
+done
+if [ "$JSON" = 1 ]; then printf '}\n'; else printf 'huella_v %d\n' "$HUELLA_V"; fi
+exit 0

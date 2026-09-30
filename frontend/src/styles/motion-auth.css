@@ -1,0 +1,155 @@
+/* Motion for the sign-in and sign-up: the launcher's dark stage (StageBackdrop,
+   the `.launcher*` block in index.css) with a glass card on it. Speaks the kit
+   in motion.css; the same rules apply -- transform, opacity and filter only,
+   `backwards` fill, everything still under prefers-reduced-motion.
+
+   The order things arrive in: the icon rises and its pieces assemble, the
+   title comes in letter by letter, then the subtitle, the card and, last and
+   quietest, the language control in the corner. */
+
+@keyframes auth-rise {
+  from {
+    opacity: 0;
+    transform: translateY(28px) scale(0.96);
+    filter: blur(10px);
+  }
+}
+.auth-icon,
+.auth-sub,
+.auth-card-in {
+  animation: auth-rise 900ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+.auth-sub {
+  animation-duration: 700ms;
+  animation-delay: 520ms;
+}
+.auth-card-in {
+  animation-delay: 360ms;
+}
+.auth-corner {
+  animation: m-fade 600ms ease-out 700ms backwards;
+}
+
+/* The title's letters, quicker than the launcher's: a sentence, not a name. */
+.auth-title .launcher-letter {
+  animation-delay: calc(160ms + var(--i) * 22ms);
+}
+
+/* The card: light under the pointer, and a slice of menta running round the
+   edge while somebody is typing in it -- the form is listening.
+
+   A dark tint rather than a backdrop blur. The blur looked like frosted glass
+   but cost a re-blur of the three drifting washes behind it every frame -- on
+   the first screen of every phone -- and it switched off whenever the card's
+   own wrapper animated (a filtered ancestor becomes the backdrop's root), so
+   the glass snapped in after the entrance and out at the start of the exit.
+   What is behind is already a blur; a tint over it reads the same, and hides
+   the dot grid from under the fields. */
+.auth-card {
+  --accent: 68 214 180;
+  background-color: rgb(14 24 21 / 0.72);
+  transition:
+    border-color 400ms ease,
+    background-color 400ms ease,
+    box-shadow 500ms ease;
+}
+.auth-card:focus-within {
+  border-color: rgb(var(--accent) / 0.3);
+  background-color: rgb(18 31 27 / 0.78);
+}
+
+/* The submit's menta glow, and a stronger one on hover. Chained with the
+   Button's own `m-btn-glow` so it outranks that hover shadow, which is small
+   and dark (made for light pages) and shrank the glow just as the pointer
+   arrived. */
+.auth-submit {
+  box-shadow: 0 12px 32px -12px rgb(68 214 180 / 0.7);
+}
+.auth-submit.m-btn-glow:not(:disabled):hover {
+  box-shadow:
+    0 16px 40px -12px rgb(68 214 180 / 0.85),
+    inset 0 1px 0 rgb(255 255 255 / 0.12);
+}
+.auth-spot {
+  background: radial-gradient(
+    420px circle at var(--mx, 50%) var(--my, 50%),
+    rgb(var(--accent) / 0.12),
+    transparent 55%
+  );
+  opacity: 0;
+  transition: opacity 350ms ease;
+}
+.auth-card:hover .auth-spot {
+  opacity: 1;
+}
+.auth-card:focus-within .launcher-ring {
+  opacity: 1;
+  animation-play-state: running;
+}
+
+/* Signed in: the words lift away and the card falls back into the blur, on
+   the same stage the launcher then rises on. A running animation outranks a
+   transition, so the entrances still under way (a password manager can send
+   the form in the first second) are stopped where they are, and the exit
+   carries on from there. */
+.launcher[data-leaving='auth'] .auth-card-in,
+.launcher[data-leaving='auth'] .auth-corner {
+  animation: none;
+}
+.auth-head,
+.auth-card-in,
+.auth-corner {
+  transition:
+    opacity 360ms ease,
+    transform 420ms cubic-bezier(0.4, 0, 0.2, 1),
+    filter 360ms ease;
+}
+.launcher[data-leaving='auth'] .auth-head {
+  opacity: 0;
+  transform: translateY(-18px);
+  filter: blur(8px);
+}
+.launcher[data-leaving='auth'] .auth-card-in {
+  opacity: 0;
+  transform: translateY(16px) scale(0.94);
+  filter: blur(12px);
+}
+.launcher[data-leaving='auth'] .auth-corner {
+  opacity: 0;
+}
+
+/* The browser's autofill paints saved fields in its own light colours, which
+   on this stage is a white slab with dark text. Painted back to glass with an
+   inset shadow -- which takes the box-shadow the focus ring is drawn with, so
+   a focused autofilled field draws the ring again itself. */
+.field-dark:-webkit-autofill,
+.field-dark:-webkit-autofill:hover {
+  -webkit-text-fill-color: #fff;
+  caret-color: #fff;
+  -webkit-box-shadow: 0 0 0 1000px rgb(28 40 36) inset;
+  transition: background-color 9999s ease-out 0s;
+}
+.field-dark:-webkit-autofill:focus {
+  -webkit-text-fill-color: #fff;
+  caret-color: #fff;
+  -webkit-box-shadow:
+    0 0 0 1000px rgb(32 46 41) inset,
+    0 0 0 3px rgb(68 214 180 / 0.25);
+  transition: background-color 9999s ease-out 0s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .auth-icon,
+  .auth-sub,
+  .auth-card-in,
+  .auth-corner {
+    animation: none;
+  }
+  .auth-card,
+  .auth-spot,
+  .auth-head,
+  .auth-card-in,
+  .auth-corner {
+    transition: none;
+  }
+}

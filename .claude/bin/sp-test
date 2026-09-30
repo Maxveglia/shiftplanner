@@ -1,0 +1,1169 @@
+#!/usr/bin/env bash
+# sp-test · corre la suite de ShiftPlanner (pytest con Postgres, vitest, tsc)
+# con la salida entera a un log y, por pantalla, un resumen corto que dice si
+# el resultado VALE o miente. Automatiza la receta de la skill
+# entorno-de-pruebas (SKILL.md y reference.md); la lógica de Python, Postgres
+# y la nube (CLAUDE_CODE_REMOTE=true) es la de .claude/evals/run.sh.
+#
+# Escrito para el bash 3.2 de macOS y para Linux: nada de arrays asociativos,
+# mapfile ni readlink -f.
+
+set -o pipefail
+
+usage() {
+  cat <<'EOF'
+Uso: sp-test [-C DIR] [--bd NOMBRE] [--sin-prep] SUBCOMANDO [args…]
+
+  prep          deja el worktree listo (idempotente): enlaces a BASE, Postgres,
+                base propia con los GRANT de infra/initdb, alembic a head y siembra
+  back [args]   pytest con SU base; los args van a pytest (tests/x.py, -k algo…)
+  front [args]  vitest run; los args van a vitest
+  tsc           tsc --noEmit
+  todo          tsc + front + back (back en paralelo) y un resumen conjunto
+  limpiar       borra SU base; para Postgres solo si lo arrancó sp-test
+  bd            imprime solo el nombre de la base de este worktree (no toca Postgres)
+
+  -C DIR        worktree a probar (por defecto: el de la carpeta actual si es un
+                checkout de ShiftPlanner; si no, el checkout donde vive el script)
+  --bd NOMBRE   otra base; si ya existe y no la creó sp-test para este worktree,
+                no se toca. Nunca 'shiftplanner' a secas.
+  --sin-prep    back: ni crea ni migra ni arranca nada; corre pytest tal cual
+  --            lo que sigue va tal cual a pytest/vitest
+
+Pytest corre sin ANTHROPIC/GEMINI/RESEND/JEV_API_KEY: no gasta saldo (el
+contrato con la API real va aparte: skill entorno-de-pruebas, paso 8).
+Salida: resumen corto; el log entero en <git-common-dir>/sp-logs/<wt>-<hash>/.
+Constancia (para el hook verde-de-verdad): back, front y tsc dejan en esa carpeta
+verde-<suite>.json con el VALE, los contadores y la huella del código al empezar (sp-huella);
+con argumentos, filtros o --sin-prep es verde-<suite>-parcial.json, que no abre la puerta.
+Código: 0 todo bien · 1 hay fallos · 2 la suite no vale o falta algo del entorno.
+EOF
+}
+
+# --- utilidades -------------------------------------------------------------------
+
+err() { printf '%s\n' "$*" >&2; }
+rojo() { if [ -t 1 ]; then printf '\033[31m%s\033[0m\n' "$*"; else printf '%s\n' "$*"; fi; }
+# Pinta de rojo las líneas de veredicto negativo, solo si la salida es una terminal.
+pintar() { if [ -t 1 ]; then sed "s/^\(VALE: NO\|LISTO: NO\|TODO: NO\).*/$(printf '\033[31m')&$(printf '\033[0m')/"; else cat; fi; }
+fisica() { (cd -P "$1" 2>/dev/null && pwd -P); }
+es_checkout() { [ -f "$1/backend/app/main.py" ] && [ -d "$1/frontend/src" ]; }
+corta() { printf '%s' "$1" | tr -s '\t\n ' '   ' | cut -c1-160; }
+
+sha6() {
+  if command -v shasum >/dev/null 2>&1; then
+    printf '%s' "$1" | shasum -a 1 | cut -c1-6
+  elif command -v sha1sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha1sum | cut -c1-6
+  else
+    printf '%s' "$1" | python3 -c 'import hashlib,sys; print(hashlib.sha1(sys.stdin.buffer.read()).hexdigest()[:6])'
+  fi
+}
+
+# Minúsculas y todo byte fuera de [a-z0-9_] a '_', en locale C para que el
+# resultado no dependa del LANG de quien llama (un hook, otra terminal…).
+# shellcheck disable=SC2018,SC2019  # a propósito: solo ASCII, en locale C
+sanea() { printf '%s' "$1" | LC_ALL=C tr 'A-Z' 'a-z' | LC_ALL=C sed 's/[^a-z0-9_]/_/g'; }
+
+# Nombre de la base de pruebas de un worktree. ÚNICA fuente del nombre:
+# prep, back, limpiar y bd pasan todos por aquí. $1 = ruta física absoluta.
+bd_de_worktree() {
+  local nombre
+  nombre=$(sanea "$(basename "$1")" | LC_ALL=C cut -c1-43)
+  printf 'shiftplanner_%s_%s\n' "$nombre" "$(sha6 "$1")"
+}
+
+dir_del_script() {
+  local p="$0" d
+  while [ -h "$p" ]; do
+    d=$(cd -P "$(dirname "$p")" && pwd)
+    p=$(readlink "$p")
+    case "$p" in /*) ;; *) p="$d/$p" ;; esac
+  done
+  cd -P "$(dirname "$p")" && pwd -P
+}
+
+# --- argumentos --------------------------------------------------------------------
+
+SUB=""; OPT_C=""; OPT_BD=""; SIN_PREP=0; PASS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --) shift; while [ $# -gt 0 ]; do PASS+=("$1"); shift; done; break ;;
+    -C) [ $# -ge 2 ] || { err "sp-test: -C necesita una carpeta"; exit 2; }; OPT_C=$2; shift ;;
+    -C?*) OPT_C=${1#-C} ;;
+    --bd) [ $# -ge 2 ] || { err "sp-test: --bd necesita un nombre"; exit 2; }; OPT_BD=$2; shift ;;
+    --bd=*) OPT_BD=${1#--bd=} ;;
+    --sin-prep) SIN_PREP=1 ;;
+    -h|--help) usage; exit 0 ;;
+    *) if [ -z "$SUB" ]; then SUB=$1; else PASS+=("$1"); fi ;;
+  esac
+  shift
+done
+
+case "$SUB" in
+  prep|back|front|tsc|todo|limpiar|bd) ;;
+  "") usage >&2; exit 2 ;;
+  *) err "sp-test: subcomando desconocido: $SUB (mira sp-test -h)"; exit 2 ;;
+esac
+case "$SUB" in
+  prep|todo|limpiar|bd)
+    if [ ${#PASS[@]} -gt 0 ]; then err "sp-test $SUB no acepta argumentos: ${PASS[*]}"; exit 2; fi ;;
+esac
+
+# --- qué worktree ------------------------------------------------------------------
+
+SCRIPT_DIR=$(dir_del_script)
+WT=""
+if [ -n "$OPT_C" ]; then
+  WT=$(fisica "$OPT_C") || { err "sp-test: -C $OPT_C no es una carpeta"; exit 2; }
+  top=$(git -C "$WT" rev-parse --show-toplevel 2>/dev/null) && es_checkout "$top" && WT=$(fisica "$top")
+  es_checkout "$WT" || { err "sp-test: $WT no es un checkout de ShiftPlanner (falta backend/app/main.py o frontend/src)"; exit 2; }
+else
+  top=$(git rev-parse --show-toplevel 2>/dev/null) && top=$(fisica "$top") && es_checkout "$top" && WT=$top
+  if [ -z "$WT" ] && es_checkout "$(pwd -P)"; then WT=$(pwd -P); fi
+  if [ -z "$WT" ]; then
+    WT=$(fisica "$SCRIPT_DIR/../..")
+    es_checkout "$WT" || { err "sp-test: no encuentro un checkout de ShiftPlanner (usa -C DIR)"; exit 2; }
+  fi
+fi
+WT_NOMBRE=$(basename "$WT")
+HEX=$(sha6 "$WT")
+DB_DEFECTO=$(bd_de_worktree "$WT")
+DB=${OPT_BD:-$DB_DEFECTO}
+
+if [ -n "$OPT_BD" ]; then
+  if ! printf '%s' "$OPT_BD" | LC_ALL=C grep -Eq '^[a-z_][a-z0-9_]{0,62}$'; then
+    err "sp-test: --bd '$OPT_BD' no vale: solo [a-z0-9_], empezando por letra o '_', máx. 63"; exit 2
+  fi
+  case "$OPT_BD" in
+    shiftplanner|postgres|template0|template1)
+      err "sp-test: --bd $OPT_BD no: esa base no es de pruebas de nadie"; exit 2 ;;
+  esac
+fi
+
+if [ "$SUB" = bd ]; then printf '%s\n' "$DB"; exit 0; fi
+
+COMMON=$(git -C "$WT" rev-parse --git-common-dir 2>/dev/null) || { err "sp-test: $WT no es un repo git"; exit 2; }
+case "$COMMON" in /*) ;; *) COMMON="$WT/$COMMON" ;; esac
+COMMON=$(fisica "$COMMON") || { err "sp-test: no encuentro el git-common-dir de $WT"; exit 2; }
+BASE=$(dirname "$COMMON")
+
+LOGDIR="$COMMON/sp-logs/$(sanea "$WT_NOMBRE" | LC_ALL=C cut -c1-43)-$HEX"
+mkdir -p "$LOGDIR" || { err "sp-test: no puedo crear $LOGDIR"; exit 2; }
+find "$LOGDIR" -maxdepth 1 -type f \( -name '*.log' -o -name '*.json' \) ! -name pg.log -mmin +4320 \
+  -exec rm -f {} + 2>/dev/null
+STAMP=$(date +%Y%m%d-%H%M%S)
+
+TMPD=$(mktemp -d "${TMPDIR:-/tmp}/sp-test.XXXXXX") || { err "sp-test: mktemp falló"; exit 2; }
+CERROJO=""
+al_salir() {
+  rm -rf "$TMPD"
+  if [ -n "$CERROJO" ] && [ "$(cat "$CERROJO/pid" 2>/dev/null)" = "$$" ]; then rm -rf "$CERROJO"; fi
+}
+trap al_salir EXIT
+trap 'exit 130' INT TERM
+
+REMOTO=0; [ "${CLAUDE_CODE_REMOTE:-}" = "true" ] && REMOTO=1
+PG_SUPER="${SP_PG_SUPERUSER:-postgres}"
+export PGPASSWORD="${PGPASSWORD:-postgres}"
+PG_CTL="${SP_PG_CTL:-/opt/homebrew/opt/postgresql@16/bin/pg_ctl}"
+PG_DATA="${SP_PG_DATA:-/opt/homebrew/var/postgresql@16}"
+MARCA_PG="$LOGDIR/postgres-lo-arranco-sp-test"
+ADMIN_URL="postgresql+psycopg://$PG_SUPER:$PGPASSWORD@localhost:5432/$DB"
+APP_URL="postgresql+psycopg://app_user:app_pass@localhost:5432/$DB"
+MIO="sp-test $WT"
+if [ "$REMOTO" = 1 ]; then
+  for bin in /usr/lib/postgresql/*/bin; do [ -d "$bin" ] && PATH="$PATH:$bin"; done
+fi
+
+nuevo_log() {  # $1 = nombre del subcomando → LOG
+  LOG="$LOGDIR/$1-$STAMP.log"
+  [ -e "$LOG" ] && LOG="$LOGDIR/$1-$STAMP-$$.log"
+  {
+    printf 'sp-test %s · %s\n' "$1" "$(date '+%Y-%m-%d %H:%M:%S')"
+    printf 'worktree: %s\nBASE: %s\nbase de datos: %s\n' "$WT" "$BASE" "$DB"
+  } >"$LOG"
+}
+paso() { printf '\n### %s\n' "$*" >>"$LOG"; }
+
+# Última línea con pinta de error de un fichero (para explicar un fallo de prep).
+motivo_de() {
+  local l
+  l=$(grep -E 'Error|ERROR|error:|FATAL|fatal:|No such|not found|denied' "$1" 2>/dev/null | tail -1)
+  [ -n "$l" ] || l=$(grep -v '^[[:space:]]*$' "$1" 2>/dev/null | tail -1)
+  corta "$l"
+}
+
+# --- Python y Node (la lógica de run.sh, más los enlaces a BASE de la skill) -----------
+
+PYVENV_LINEA=""
+asegurar_python() {
+  local venv="$WT/backend/.venv"
+  if [ ! -e "$venv" ] && [ ! -h "$venv" ] && [ "$BASE" != "$WT" ] && [ -d "$BASE/backend/.venv" ]; then
+    ln -s "$BASE/backend/.venv" "$venv" && PYVENV_LINEA="backend/.venv enlazado → BASE (nuevo)"
+  elif [ -h "$venv" ]; then
+    PYVENV_LINEA="backend/.venv ya existía (enlace)"
+  elif [ -d "$venv" ]; then
+    PYVENV_LINEA="backend/.venv ya existía (propio)"
+  fi
+  SP_PY="$venv/bin/python"
+  paso "python: import app, pytest desde backend/"
+  if [ -x "$SP_PY" ] && (cd "$WT/backend" && "$SP_PY" -c 'import app, pytest') >>"$LOG" 2>&1; then
+    return 0
+  fi
+  if [ -h "$venv" ]; then
+    FALLO_ENTORNO="backend/.venv (enlace a BASE) no importa app/pytest: ¿la rama trae una dependencia nueva? Quita el enlace y crea un venv propio con pip install -e '.[dev]'"
+    return 2
+  fi
+  paso "backend sin entorno: creando backend/.venv (run.sh)"
+  if python3 -m venv "$venv" >>"$LOG" 2>&1; then
+    "$venv/bin/pip" install -q -e "$WT/backend[dev]" >>"$LOG" 2>&1
+  elif command -v uv >/dev/null 2>&1; then
+    uv venv -q "$venv" >>"$LOG" 2>&1 && VIRTUAL_ENV="$venv" uv pip install -q -e "$WT/backend[dev]" >>"$LOG" 2>&1
+  fi
+  if [ -x "$SP_PY" ] && (cd "$WT/backend" && "$SP_PY" -c 'import app, pytest') >>"$LOG" 2>&1; then
+    PYVENV_LINEA="backend/.venv creado en el worktree"
+    return 0
+  fi
+  FALLO_ENTORNO="no pude preparar backend/.venv (ni python3 -m venv ni uv)"
+  return 2
+}
+
+# Paquetes de frontend/package.json (dependencies y devDependencies) que no están en
+# el node_modules $1. Vacío = están todos.
+paquetes_que_faltan() {
+  node -e '
+    const p = require(process.argv[1]), fs = require("fs");
+    const deps = Object.keys(Object.assign({}, p.dependencies, p.devDependencies));
+    console.log(deps.filter(n => !fs.existsSync(process.argv[2] + "/" + n + "/package.json")).join(" "));
+  ' "$WT/frontend/package.json" "$1" 2>>"$LOG"
+}
+
+npm_ci_en_worktree() {  # $1 = por qué
+  paso "npm ci en frontend/ ($1)"
+  if (cd "$WT/frontend" && npm ci --no-audit --no-fund) >>"$LOG" 2>&1; then
+    NODE_LINEA="frontend/node_modules instalado con npm ci en el worktree ($1)"; NODE_FALTAN=""; return 0
+  fi
+  FALLO_ENTORNO="npm ci falló en frontend/ ($(motivo_de "$LOG"))"
+  return 2
+}
+
+# $1 = prep: puede cambiar un ENLACE desactualizado por un npm ci propio (nunca
+# toca una carpeta real ni el node_modules de BASE). Sin prep solo avisa.
+NODE_LINEA=""; NODE_FALTAN=""
+asegurar_node() {
+  local nm="$WT/frontend/node_modules" modo=${1:-} faltan
+  command -v node >/dev/null 2>&1 || { FALLO_ENTORNO="no encuentro node en el PATH"; return 2; }
+  if [ -h "$nm" ] && [ ! -d "$nm" ]; then
+    [ "$modo" = prep ] || { FALLO_ENTORNO="frontend/node_modules es un enlace roto → $(readlink "$nm")"; return 2; }
+    rm -f "$nm"
+  fi
+  if [ -e "$nm" ] || [ -h "$nm" ]; then
+    NODE_FALTAN=$(paquetes_que_faltan "$nm")
+    if [ -h "$nm" ]; then NODE_LINEA="frontend/node_modules ya existía (enlace)"
+    else NODE_LINEA="frontend/node_modules ya existía (propio)"; fi
+    if [ -n "$NODE_FALTAN" ] && [ -h "$nm" ] && [ "$modo" = prep ]; then
+      rm -f "$nm"   # solo el enlace: rm sin -r no entra en el destino
+      npm_ci_en_worktree "al enlace a BASE le faltaban: $NODE_FALTAN"
+      return $?
+    fi
+    return 0
+  fi
+  if [ "$BASE" != "$WT" ] && [ -d "$BASE/frontend/node_modules" ]; then
+    faltan=$(paquetes_que_faltan "$BASE/frontend/node_modules")
+    if [ -z "$faltan" ]; then
+      ln -s "$BASE/frontend/node_modules" "$nm" && { NODE_LINEA="frontend/node_modules enlazado → BASE (nuevo)"; return 0; }
+    fi
+    npm_ci_en_worktree "a node_modules de BASE le faltan: $faltan"
+    return $?
+  fi
+  npm_ci_en_worktree "no había node_modules"
+}
+
+# La trampa del .venv enlazado: app tiene que salir de ESTE worktree.
+APP_FILE=""
+comprobar_trampa_venv() {
+  APP_FILE=$(cd "$WT/backend" && "$SP_PY" -c 'import os, app; print(os.path.realpath(app.__file__))' 2>>"$LOG")
+  case "$APP_FILE" in "$WT"/*) return 0 ;; esac
+  return 2
+}
+
+# --- Postgres ----------------------------------------------------------------------------
+
+psql_su() { psql -X -q -h localhost -p 5432 -U "$PG_SUPER" -v ON_ERROR_STOP=1 "$@"; }
+pg_vivo() { pg_isready -h localhost -p 5432 -q 2>/dev/null; }
+
+PG_LINEA=""
+asegurar_postgres() {
+  if ! command -v pg_isready >/dev/null 2>&1 || ! command -v psql >/dev/null 2>&1; then
+    FALLO_ENTORNO="no encuentro pg_isready/psql en el PATH"; return 2
+  fi
+  paso "postgres: pg_isready"
+  if pg_vivo; then
+    if [ -f "$MARCA_PG" ]; then PG_LINEA="en marcha (lo arrancó sp-test: limpiar lo parará)"
+    else PG_LINEA="ya estaba en marcha (no lo pararé)"; fi
+  else
+    if [ "$REMOTO" = 1 ]; then
+      paso "nube: arrancando PostgreSQL (run.sh)"
+      { service postgresql start || sudo -n service postgresql start; } >>"$LOG" 2>&1
+      printf 'service\n' >"$MARCA_PG"
+    else
+      [ -x "$PG_CTL" ] || { FALLO_ENTORNO="Postgres no responde y no encuentro $PG_CTL"; return 2; }
+      paso "arrancando Postgres con pg_ctl"
+      if ! "$PG_CTL" -D "$PG_DATA" -l "$LOGDIR/pg.log" -w start >>"$LOG" 2>&1; then
+        FALLO_ENTORNO="pg_ctl start falló (ver $LOGDIR/pg.log)"; return 2
+      fi
+      printf 'pg_ctl\n' >"$MARCA_PG"
+    fi
+    local i=0
+    while [ $i -lt 15 ] && ! pg_vivo; do sleep 1; i=$((i + 1)); done
+    pg_vivo || { FALLO_ENTORNO="Postgres no responde en localhost:5432 tras arrancarlo"; return 2; }
+    PG_LINEA="arrancado por sp-test (limpiar lo parará)"
+  fi
+  if [ "$REMOTO" = 1 ]; then
+    su postgres -c "psql -qc \"ALTER USER postgres PASSWORD '$PGPASSWORD'\"" >/dev/null 2>&1 \
+      || sudo -n -u postgres psql -qc "ALTER USER postgres PASSWORD '$PGPASSWORD'" >/dev/null 2>&1 \
+      || printf 'no pude poner contraseña al rol postgres\n' >>"$LOG"
+  fi
+  return 0
+}
+
+bd_existe() { [ "$(psql_su -d postgres -Atc "SELECT 1 FROM pg_database WHERE datname = '$DB'" 2>>"$LOG")" = 1 ]; }
+bd_comentario() {
+  psql_su -d postgres -Atc "SELECT coalesce(shobj_description(oid, 'pg_database'), '') FROM pg_database WHERE datname = '$DB'" 2>>"$LOG"
+}
+# De sp-test para ESTE worktree: la de por defecto (su nombre lleva el hash de la
+# ruta) o una --bd que sp-test creó y marcó con un comentario.
+bd_es_mia() {
+  local c
+  [ "$DB" = "$DB_DEFECTO" ] && return 0
+  c=$(bd_comentario)
+  [ "$c" = "$MIO" ] || [ "$c" = "$MIO · sembrada" ]
+}
+bd_comentar() {  # $1 = texto
+  local t
+  t=$(printf '%s' "$1" | sed "s/'/''/g")
+  psql_su -d postgres -c "COMMENT ON DATABASE $DB IS '$t'" >>"$LOG" 2>&1
+}
+
+con_bd() {  # corre "$@" desde backend/ con las dos variables apuntando a SU base
+  (cd "$WT/backend" && ADMIN_DATABASE_URL="$ADMIN_URL" APP_DATABASE_URL="$APP_URL" "$@")
+}
+
+migrar() {  # alembic upgrade head → MIGRA_LINEA
+  local out="$TMPD/alembic.$$.out" n ultima
+  paso "alembic upgrade head"
+  if ! con_bd "$SP_PY" -m alembic upgrade head >"$out" 2>&1; then
+    cat "$out" >>"$LOG"
+    if grep -q 'Multiple head' "$out"; then
+      FALLO_ENTORNO="alembic: hay varias cabezas (mira '.venv/bin/python -m alembic heads' en backend/)"
+    else
+      FALLO_ENTORNO="alembic upgrade head falló: $(motivo_de "$out")"
+    fi
+    return 2
+  fi
+  cat "$out" >>"$LOG"
+  n=$(grep -c 'Running upgrade' "$out")
+  ultima=$(sed -n 's/.*Running upgrade .*-> \([^ ,]*\).*/\1/p' "$out" | tail -1)
+  if [ "$n" -gt 0 ]; then MIGRA_LINEA="alembic aplicó $n migraciones (→ $ultima)"
+  else MIGRA_LINEA="alembic ya estaba a head"; fi
+  return 0
+}
+
+sembrar() {
+  paso "siembra: python -m app.seeds.labor"
+  if ! con_bd "$SP_PY" -m app.seeds.labor >>"$LOG" 2>&1; then
+    FALLO_ENTORNO="la siembra (python -m app.seeds.labor) falló: $(motivo_de "$LOG")"; return 2
+  fi
+  bd_comentar "$MIO · sembrada"
+}
+
+# Deja SU base lista. $1 = completo (prep: migra y siembra siempre) | rapido
+# (back: si ya existe, solo alembic; siembra solo si nunca se sembró).
+BD_LINEA=""
+asegurar_bd() {
+  local modo=$1 sql
+  MIGRA_LINEA=""
+  if bd_existe; then
+    if ! bd_es_mia; then
+      FALLO_ENTORNO="la base $DB ya existe y no la creó sp-test para este worktree: no la toco"; return 2
+    fi
+    migrar || return 2
+    case "$(bd_comentario)" in
+      *" · sembrada") [ "$modo" = completo ] && { sembrar || return 2; } ;;
+      *) sembrar || return 2 ;;
+    esac
+    BD_LINEA="ya existía · $MIGRA_LINEA"
+    [ "$modo" = completo ] && BD_LINEA="$BD_LINEA · sembrada"
+    return 0
+  fi
+  paso "createdb $DB + GRANT de infra/initdb/01-app-role.sql"
+  if ! createdb -h localhost -p 5432 -U "$PG_SUPER" "$DB" >>"$LOG" 2>&1; then
+    FALLO_ENTORNO="createdb $DB falló: $(motivo_de "$LOG")"; return 2
+  fi
+  bd_comentar "$MIO"
+  sql=$(sed "s/ON DATABASE shiftplanner /ON DATABASE $DB /" "$WT/infra/initdb/01-app-role.sql")
+  if printf '%s\n' "$sql" | grep -q 'ON DATABASE shiftplanner ' || ! printf '%s\n' "$sql" | grep -q "ON DATABASE $DB "; then
+    FALLO_ENTORNO="infra/initdb/01-app-role.sql cambió: el sed ya no apunta los GRANT a $DB"; return 2
+  fi
+  if ! printf '%s\n' "$sql" | psql_su -d "$DB" >>"$LOG" 2>&1; then
+    FALLO_ENTORNO="los GRANT de infra/initdb fallaron: $(motivo_de "$LOG")"; return 2
+  fi
+  migrar || return 2
+  sembrar || return 2
+  BD_LINEA="creada · GRANT de infra/initdb · $MIGRA_LINEA · sembrada"
+  return 0
+}
+
+tomar_cerrojo() {
+  local c="$LOGDIR/cerrojo-$DB" p
+  if ! mkdir "$c" 2>/dev/null; then
+    p=$(cat "$c/pid" 2>/dev/null)
+    if [ -n "$p" ] && kill -0 "$p" 2>/dev/null; then
+      FALLO_ENTORNO="otra ejecución de sp-test (pid $p) está usando la base $DB"; return 2
+    fi
+    rm -rf "$c"; mkdir "$c" 2>/dev/null || { FALLO_ENTORNO="no puedo tomar el cerrojo $c"; return 2; }
+  fi
+  printf '%s\n' "$$" >"$c/pid"
+  CERROJO=$c
+}
+soltar_cerrojo() { [ -n "$CERROJO" ] && rm -rf "$CERROJO"; CERROJO=""; }
+
+# --- el resumen (Python: parsea el JSON del plugin, el de vitest o la salida de tsc) ----
+
+escribir_ayudantes() {
+  cat >"$TMPD/sp_test_resumen.py" <<'PY'
+"""sp-test: plugin de pytest que deja un resumen en JSON (lo carga sp-test con -p)."""
+import json
+import os
+import re
+import sys
+
+_SALIDA = os.environ.get("SP_TEST_JSON", "")
+_ESQUEMA = re.compile(r"UndefinedColumn|UndefinedTable|UndefinedObject|InvalidCatalogName|does not exist")
+_C = {"passed": 0, "failed": 0, "errors": 0, "skipped": 0, "xfailed": 0, "xpassed": 0, "deselected": 0}
+_FALLOS = []
+_SALTOS = []
+
+
+def _linea_e(texto):
+    for linea in texto.splitlines():
+        if linea.startswith("E "):
+            s = linea[1:].strip()
+            if s:
+                return s
+    return ""
+
+
+def _entradas(longrepr):
+    chain = getattr(longrepr, "chain", None)
+    tb = chain[-1][0] if chain else getattr(longrepr, "reprtraceback", None)
+    res = []
+    for e in getattr(tb, "reprentries", None) or []:
+        loc = getattr(e, "reprfileloc", None)
+        if loc is not None:
+            res.append((str(loc.path), int(loc.lineno)))
+    return res
+
+
+def _en_repo(p):
+    return not (p.startswith("/") or p.startswith("..") or "site-packages" in p)
+
+
+def _fallo(report, fase):
+    texto = getattr(report, "longreprtext", "") or ""
+    msg = _linea_e(texto)
+    crash = getattr(getattr(report, "longrepr", None), "reprcrash", None)
+    if not msg and crash is not None and getattr(crash, "message", ""):
+        msg = (crash.message.strip().splitlines() or [""])[0]
+    if not msg:
+        lineas = [x.strip() for x in texto.splitlines() if x.strip()]
+        msg = lineas[-1] if lineas else report.outcome
+    fichero = report.nodeid.split("::")[0]
+    ents = _entradas(getattr(report, "longrepr", None))
+    en_test = [e for e in ents if e[0] == fichero]
+    en_repo = [e for e in ents if _en_repo(e[0])]
+    loc = en_test[-1] if en_test else (en_repo[-1] if en_repo else None)
+    if loc is None and getattr(report, "location", None) and report.location[1] is not None:
+        loc = (report.location[0], report.location[1] + 1)
+    hondo = en_repo[-1] if en_repo else None
+    return {
+        "id": report.nodeid or "(colección)",
+        "fase": fase,
+        "msg": msg,
+        "loc": "%s:%d" % loc if loc else "",
+        "hondo": "%s:%d" % hondo if hondo and hondo != loc else "",
+        "esquema": bool(_ESQUEMA.search(texto)),
+    }
+
+
+def _salto(report):
+    lr = report.longrepr
+    motivo = lr[2] if isinstance(lr, tuple) and len(lr) == 3 else str(lr)
+    if motivo.startswith("Skipped: "):
+        motivo = motivo[len("Skipped: "):]
+    return {"id": report.nodeid, "motivo": motivo}
+
+
+def pytest_runtest_logreport(report):
+    xf = hasattr(report, "wasxfail")
+    if report.when == "call":
+        if report.passed:
+            _C["xpassed" if xf else "passed"] += 1
+        elif report.failed:
+            _C["failed"] += 1
+            _FALLOS.append(_fallo(report, "call"))
+        elif report.skipped:
+            if xf:
+                _C["xfailed"] += 1
+            else:
+                _C["skipped"] += 1
+                _SALTOS.append(_salto(report))
+    elif report.failed:
+        _C["errors"] += 1
+        _FALLOS.append(_fallo(report, report.when))
+    elif report.skipped:
+        if xf:
+            _C["xfailed"] += 1
+        else:
+            _C["skipped"] += 1
+            _SALTOS.append(_salto(report))
+
+
+def pytest_collectreport(report):
+    if report.failed:
+        _C["errors"] += 1
+        _FALLOS.append(_fallo(report, "colección"))
+    elif report.skipped:
+        _C["skipped"] += 1
+        _SALTOS.append(_salto(report))
+
+
+def pytest_deselected(items):
+    _C["deselected"] += len(items)
+
+
+def pytest_sessionfinish(session, exitstatus):
+    if not _SALIDA:
+        return
+    app = sys.modules.get("app")
+    fich = getattr(app, "__file__", "") or ""
+    datos = {
+        "exitstatus": int(exitstatus),
+        "recogidos": int(getattr(session, "testscollected", 0) or 0),
+        "cuentas": _C,
+        "fallos": _FALLOS,
+        "saltos": _SALTOS,
+        "app_file": os.path.realpath(fich) if fich else "",
+    }
+    with open(_SALIDA, "w", encoding="utf-8") as f:
+        json.dump(datos, f)
+PY
+
+  cat >"$TMPD/resumir.py" <<'PY'
+"""sp-test: convierte el JSON del plugin / de vitest / la salida de tsc en un resumen corto.
+
+Uso: resumir.py MODO LOG JSON MAXF WT RC. Imprime RESULTADO, VALE y la lista de
+fallos; sale con 0 (bien), 1 (fallos) o 2 (la suite no vale / no llegó a correr).
+"""
+import json
+import os
+import re
+import sys
+
+modo, log, js, maxf, wt, rc = sys.argv[1:7]
+maxf, rc = int(maxf), int(rc)
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
+
+
+def corta(s, n=160):
+    s = " ".join(str(s).split())
+    return s if len(s) <= n else s[: n - 1] + "…"
+
+
+def leer_log():
+    try:
+        with open(log, encoding="utf-8", errors="replace") as f:
+            return ANSI.sub("", f.read())
+    except OSError:
+        return ""
+
+
+def leer_json():
+    try:
+        with open(js, encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return None
+
+
+def motivo_log(txt, patrones):
+    lineas = [x.strip() for x in txt.splitlines() if x.strip()]
+    for pat in patrones:
+        for x in lineas:
+            if re.search(pat, x):
+                return corta(x)
+    return corta(lineas[-1]) if lineas else "el log está vacío"
+
+
+def lista(titulo, items, maxn, total=None):
+    if not items:
+        return []
+    res = ["%s (%d):" % (titulo, len(items) if total is None else total)]
+    res += items[:maxn]
+    if len(items) > maxn:
+        res.append("… y %d más, ver log" % (len(items) - maxn))
+    return res
+
+
+def back():
+    txt = leer_log()
+    d = leer_json()
+    fin = None
+    for linea in reversed(txt.splitlines()[-80:]):
+        m = re.search(r"((?:\d+ [a-z]+(?:, )?)+|no tests ran)(?: in [\d.]+s)", linea)
+        if m:
+            fin = m.group(1).strip().rstrip(",")
+            break
+    if d is None:
+        print("RESULTADO: pytest no llegó a correr")
+        print("VALE: NO — " + motivo_log(txt, [r"^ERROR", r"Error", r"^E "]))
+        return 2
+    c = d["cuentas"]
+    partes = ["%d passed" % c["passed"], "%d skipped" % c["skipped"], "%d failed" % c["failed"],
+              "%d errors" % c["errors"], "%d xfailed" % c["xfailed"]]
+    if c["xpassed"]:
+        partes.append("%d xpassed" % c["xpassed"])
+    if c["deselected"]:
+        partes.append("%d deselected" % c["deselected"])
+    print("RESULTADO: " + " · ".join(partes))
+    if fin and fin != "no tests ran":
+        dice = {}
+        for n, w in re.findall(r"(\d+) ([a-z]+)", fin):
+            w = "errors" if w.startswith("error") else w
+            dice[w] = int(n)
+        dice.pop("warnings", None)
+        dice.pop("warning", None)
+        if any(dice.get(k, 0) != c[k] for k in c):
+            print("ojo: el final del log dice «%s»" % fin)
+
+    st = d["exitstatus"]
+    fallos, saltos = d["fallos"], d["saltos"]
+    fuera = [s for s in saltos if "test_intake_schema_contract" not in s["id"]]
+    esquema = [f for f in fallos if f["esquema"]]
+    col = [f for f in fallos if f["fase"] == "colección"]
+    vale, extra = True, []
+    if st in (2, 3, 4) or (st == 5 and not c["deselected"]) or d["recogidos"] == 0 and not col:
+        vale = False
+        if col:
+            f = col[0]
+            m = "error al importar %s: %s" % (f["id"], corta(f["msg"], 110))
+            if re.search(r"ModuleNotFoundError|ImportError", f["msg"]):
+                m += " (¿dependencia nueva que el .venv enlazado no tiene?)"
+        elif st in (2, 3, 4):
+            m = motivo_log(txt, [r"^ERROR", r"INTERNALERROR", r"Interrupted"])
+        else:
+            m = "no se recogió ningún test"
+        print("VALE: NO — pytest no llegó a correr (%s)" % m)
+    elif d["app_file"] and not d["app_file"].startswith(wt + os.sep):
+        vale = False
+        print("VALE: NO — pytest importó app de %s, fuera del worktree (trampa del .venv enlazado)" % d["app_file"])
+    elif fuera:
+        vale = False
+        print("VALE: NO — %d skipped fuera de test_intake_schema_contract: falta Postgres, la base o las variables"
+              % len(fuera))
+        grupos = {}
+        orden = []
+        for s in fuera:
+            k = (s["id"].split("::")[0], corta(s["motivo"], 90))
+            if k not in grupos:
+                grupos[k] = 0
+                orden.append(k)
+            grupos[k] += 1
+        extra = lista("SALTADOS fuera de intake, por fichero y motivo",
+                      ["%s — %d × %s" % (k[0], grupos[k], k[1]) for k in orden], 5)
+        maxf = min(MAXF, 12)
+    elif len(esquema) >= 3:
+        vale = False
+        print("VALE: NO — cascada de %d errores de esquema (UndefinedColumn/«does not exist»): "
+              "la base no está a head o a la rama le falta una migración; no es la lógica" % len(esquema))
+    else:
+        n_int = len(saltos) - len(fuera)
+        if n_int:
+            print("VALE: sí (los %d skipped son de test_intake_schema_contract, que pide ANTHROPIC_API_KEY)" % n_int)
+        else:
+            print("VALE: sí")
+    if not extra:
+        maxf = MAXF
+    for x in extra:
+        print(x)
+    # Los fallos con el mismo mensaje y el mismo sitio (una cascada) van en una línea.
+    grupos, orden = {}, []
+    for f in fallos:
+        loc = f["loc"] + (" → " + f["hondo"] if f["hondo"] else "")
+        k = (corta(f["msg"]), loc)
+        if k not in grupos:
+            grupos[k] = []
+            orden.append(k)
+        grupos[k].append(f)
+    lineas = []
+    for k in orden:
+        fs = grupos[k]
+        sitio = " (%s)" % k[1] if k[1] else ""
+        if len(fs) >= 3:
+            lineas.append("%d × %s%s — p. ej. %s" % (len(fs), k[0], sitio, fs[0]["id"]))
+            continue
+        for f in fs:
+            ident = f["id"] + (" (al importar)" if f["fase"] == "colección" else
+                               " [%s]" % f["fase"] if f["fase"] in ("setup", "teardown") else "")
+            lineas.append("%s — %s%s" % (ident, k[0], sitio))
+    for x in lista("FALLOS", lineas, maxf, total=len(fallos)):
+        print(x)
+    if not vale:
+        return 2
+    return 1 if (c["failed"] or c["errors"]) else 0
+
+
+def front():
+    txt = leer_log()
+    d = leer_json()
+    ft = [m for m in re.findall(r"^\s*Test Files\s+(.+)$", txt, re.M)]
+    ts = [m for m in re.findall(r"^\s*Tests\s+(\d.+)$", txt, re.M)]
+    if d is None and not ft:
+        print("RESULTADO: vitest no llegó a correr")
+        print("VALE: NO — " + motivo_log(txt, [r"No test files found", r"^Error", r"Error:", r"ERR"]))
+        return 2
+    if ft:
+        res = "Test Files %s · Tests %s" % (" ".join(ft[-1].split()), " ".join(ts[-1].split()) if ts else "?")
+    else:
+        res = "Test Files %d passed · %d failed · Tests %d passed · %d failed · %d skipped" % (
+            d["numPassedTestSuites"], d["numFailedTestSuites"], d["numPassedTests"],
+            d["numFailedTests"], d["numPendingTests"] + d.get("numTodoTests", 0))
+    print("RESULTADO: " + res)
+    base = os.path.join(wt, "frontend") + os.sep
+    lineas, faltan = [], []
+    total = failed = 0
+    if d is not None:
+        total = d.get("numTotalTests", 0)
+        failed = d.get("numFailedTests", 0) + d.get("numFailedTestSuites", 0)
+        for tr in d.get("testResults", []):
+            fich = tr.get("name", "").replace(base, "")
+            ars = tr.get("assertionResults") or []
+            malos = [a for a in ars if a.get("status") == "failed"]
+            if tr.get("status") == "failed" and not malos:
+                msg = (tr.get("message") or "").strip().splitlines()
+                lineas.append("%s (al cargar) — %s" % (fich, corta(msg[0] if msg else "falló al cargar")))
+                faltan += re.findall(r"(?:Failed to resolve import|Cannot find (?:package|module)) ['\"]([^./'\"][^'\"]*)['\"]"
+                                     r"|Failed to load url ([^./\s][^\s]*)", tr.get("message") or "")
+            for a in malos:
+                nombre = " > ".join([fich] + (a.get("ancestorTitles") or []) + [a.get("title", "")])
+                fm = "\n".join(a.get("failureMessages") or [])
+                primera = next((x.strip() for x in ANSI.sub("", fm).splitlines() if x.strip()), "falló")
+                locs = re.findall(re.escape(base) + r"([^\s:()]+):(\d+):\d+", fm)
+                loc = next(("%s:%s" % l for l in locs if l[0] == fich), None) or (
+                    "%s:%s" % locs[0] if locs else "")
+                lineas.append("%s — %s%s" % (nombre, corta(primera), " (%s)" % loc if loc else ""))
+    if d is not None and total == 0 and not lineas:
+        print("VALE: NO — no se corrió ningún test (¿el filtro no casa con nada?)")
+        return 2
+    faltan = [x for t in faltan for x in (t if isinstance(t, tuple) else (t,)) if x]
+    faltan += os.environ.get("SP_FALTAN", "").split()
+    if faltan:
+        print(falta_msg(sorted(set(faltan))))
+        vale = False
+    else:
+        print("VALE: sí")
+        vale = True
+    for x in lista("FALLOS", lineas, MAXF):
+        print(x)
+    if not vale:
+        return 2
+    return 1 if (failed or lineas or rc != 0) else 0
+
+
+def tsc():
+    txt = leer_log()
+    errs = re.findall(r"^(.+?)\((\d+),(\d+)\): error (TS\d+): (.*)$", txt, re.M)
+    glob = re.findall(r"^error (TS\d+): (.*)$", txt, re.M)
+    if rc == 0 and not errs and not glob:
+        print("RESULTADO: 0 errores")
+        print("VALE: sí")
+        return 0
+    if not errs and not glob:
+        print("RESULTADO: tsc no llegó a correr")
+        print("VALE: NO — " + motivo_log(txt, [r"error", r"Error", r"not found"]))
+        return 2
+    por = {}
+    for e in errs:
+        por[e[0]] = por.get(e[0], 0) + 1
+    print("RESULTADO: %d errores en %d ficheros" % (len(errs) + len(glob), len(por)))
+    faltan = sorted(set([m for e in errs if e[3] == "TS2307"
+                         for m in re.findall(r"Cannot find module '([^./'][^']*)'", e[4])]
+                        + os.environ.get("SP_FALTAN", "").split()))
+    if glob:
+        print("VALE: NO — error de configuración de tsc: %s %s" % (glob[0][0], corta(glob[0][1], 110)))
+        vale = False
+    elif faltan:
+        print(falta_msg(faltan))
+        vale = False
+    else:
+        print("VALE: sí")
+        vale = True
+    orden = sorted(errs, key=lambda e: (e[0], int(e[1]), int(e[2])))
+    if len(por) > 1:
+        print(corta("Por fichero: " + " · ".join("%s %d" % (k, por[k]) for k in sorted(por)), 200))
+    lineas = ["%s(%s,%s): %s %s" % (e[0], e[1], e[2], e[3], corta(e[4])) for e in orden]
+    for x in lista("ERRORES", lineas, MAXF):
+        print(x)
+    return 1 if vale else 2
+
+
+def falta_msg(paquetes):
+    # 'barcode-detector/ponyfill' → 'barcode-detector'; '@a/b/c' → '@a/b'
+    paquetes = sorted(set("/".join(n.split("/")[:2]) if n.startswith("@") else n.split("/")[0] for n in paquetes))
+    return ("VALE: NO — a frontend/node_modules le faltan %s (¿enlace a BASE desactualizado?): "
+            "quita el enlace y corre sp-test prep, que hará npm ci en el worktree" % ", ".join(paquetes))
+
+
+MAXF = maxf
+sys.exit({"back": back, "front": front, "tsc": tsc}[modo]())
+PY
+
+  cat >"$TMPD/constancia.py" <<'PY'
+"""sp-test: deja constancia de una ejecución de back, front o tsc para el hook verde-de-verdad.
+
+Uso: constancia.py SUITE RC BLOQUE DATOS WT PARCIAL HUELLAS LOG DIR SP_HUELLA [ARGS…]
+Escribe DIR/verde-SUITE.json si la ejecución fue completa (PARCIAL vacío) o
+DIR/verde-SUITE-parcial.json si no: una parcial sirve para iterar, no abre la puerta.
+No decide nada: copia el VALE del bloque y el código (0/1/2) que ya calculó resumir.py.
+"""
+import datetime
+import json
+import os
+import re
+import sys
+import tempfile
+
+suite, rc, bloque, datos, wt, parcial, huellas, log, destino, sp_huella = sys.argv[1:11]
+args = sys.argv[11:]
+
+
+def leer(ruta):
+    try:
+        with open(ruta, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def leer_json(texto):
+    try:
+        return json.loads(texto)
+    except ValueError:
+        return None
+
+
+h = leer_json(huellas) if huellas else None
+h = h if isinstance(h, dict) else None
+lineas = leer(bloque).splitlines()
+vale_linea = next((x for x in lineas if x.startswith("VALE:")), "")
+resultado = next((x for x in lineas if x.startswith("RESULTADO:")), "")
+c = {"passed": None, "failed": None, "errors": None, "skipped": None}
+d = leer_json(leer(datos)) if os.path.isfile(datos) else None
+if suite == "back" and isinstance(d, dict):
+    k = d.get("cuentas") or {}
+    c = {"passed": k.get("passed"), "failed": k.get("failed"), "errors": k.get("errors"), "skipped": k.get("skipped")}
+    if k.get("deselected") and not parcial:
+        parcial = "%d tests deseleccionados" % k["deselected"]
+elif suite == "front" and isinstance(d, dict):
+    c = {"passed": d.get("numPassedTests"), "failed": d.get("numFailedTests"),
+         "errors": d.get("numFailedTestSuites"),
+         "skipped": (d.get("numPendingTests") or 0) + (d.get("numTodoTests") or 0)}
+elif suite == "tsc":
+    m = re.match(r"RESULTADO: (\d+) errores", resultado)
+    if m:
+        c = {"passed": None, "failed": int(m.group(1)), "errors": 0, "skipped": None}
+constancia = {
+    "suite": suite,
+    "completa": not parcial,
+    "parcial_por": parcial or None,
+    "args": args,
+    "vale": vale_linea.startswith("VALE: sí"),
+    "vale_linea": vale_linea,
+    "resultado": resultado,
+    "rc": int(rc),
+    **c,
+    "huellas": {k: v for k, v in h.items() if k != "huella_v"} if h else None,
+    "huella_v": h.get("huella_v", 1) if h else None,
+    "sp_huella": sp_huella,
+    "fecha": datetime.datetime.now().astimezone().isoformat(timespec="seconds"),
+    "worktree": wt,
+    "log": log,
+}
+nombre = os.path.join(destino, "verde-%s%s.json" % (suite, "-parcial" if parcial else ""))
+fd, tmp = tempfile.mkstemp(prefix=".verde-", dir=destino)
+with os.fdopen(fd, "w", encoding="utf-8") as f:
+    json.dump(constancia, f, ensure_ascii=False, indent=1)
+os.replace(tmp, nombre)
+PY
+}
+
+python_para_resumir() {
+  if [ -n "${SP_PY:-}" ] && [ -x "$SP_PY" ]; then printf '%s' "$SP_PY"; return; fi
+  if python3 -c 1 >/dev/null 2>&1; then printf 'python3'; return; fi
+  printf '%s' "$WT/backend/.venv/bin/python"
+}
+
+# --- constancia para el hook verde-de-verdad ----------------------------------------------
+# Cada back/front/tsc (también dentro de todo) deja en $LOGDIR/verde-<suite>.json qué
+# probó: completa o no, el VALE, el código, los contadores y la HUELLA del código
+# (sp-huella) calculada AL EMPEZAR, porque la suite prueba ese estado y no el que haya al
+# acabar. Sin sp-huella, o si falla, la constancia sale sin huella y no abre la puerta.
+HUELLAS=""
+calcular_huellas() {
+  [ -x "$SCRIPT_DIR/sp-huella" ] && HUELLAS=$("$SCRIPT_DIR/sp-huella" -C "$WT" --json 2>/dev/null)
+  return 0
+}
+
+# $1 = back|front|tsc · $2 = código del resumen (0/1/2). Nunca cambia el resultado de sp-test.
+dejar_constancia() {
+  local parcial=""
+  [ ${#PASS[@]} -gt 0 ] && parcial="con argumentos: ${PASS[*]}"
+  if [ "$1" = back ]; then
+    [ "$SIN_PREP" = 1 ] && parcial="${parcial:+$parcial · }--sin-prep"
+    [ -n "${PYTEST_ADDOPTS:-}" ] && parcial="${parcial:+$parcial · }PYTEST_ADDOPTS=$PYTEST_ADDOPTS"
+  fi
+  "$(python_para_resumir)" "$TMPD/constancia.py" "$1" "$2" "$TMPD/$1.bloque" "$TMPD/$1.json" "$WT" \
+      "$parcial" "$HUELLAS" "$LOG" "$LOGDIR" "$SCRIPT_DIR/sp-huella" "${PASS[@]}" >>"$LOG" 2>&1 ||
+    printf 'sp-test: no pude dejar la constancia de %s para verde-de-verdad\n' "$1" >>"$LOG"
+  return 0
+}
+
+# --- los tres corredores: cada uno deja su bloque en $TMPD/<parte>.bloque ------------------
+# (RESULTADO / VALE / FALLOS, sin cabecera) y devuelve 0, 1 o 2.
+
+MAXF=20
+
+bloque_fallo_entorno() {  # $1 = parte, $2 = qué no llegó a correr
+  {
+    printf 'RESULTADO: %s no llegó a correr\n' "$2"
+    printf 'VALE: NO — %s\n' "$FALLO_ENTORNO"
+  } >"$TMPD/$1.bloque"
+  return 2
+}
+
+correr_back() {
+  local json="$TMPD/back.json" rc r
+  FALLO_ENTORNO=""
+  nuevo_log back
+  : >"$TMPD/back.bloque"
+  asegurar_python || { bloque_fallo_entorno back pytest; return 2; }
+  if ! comprobar_trampa_venv; then
+    {
+      printf 'RESULTADO: pytest no se lanzó\n'
+      rojo "VALE: NO — desde backend/, app.__file__ = ${APP_FILE:-?}: fuera del worktree (trampa del .venv enlazado)"
+    } >"$TMPD/back.bloque"
+    return 2
+  fi
+  if [ "$SIN_PREP" = 1 ]; then
+    if pg_vivo && bd_existe && ! bd_es_mia; then
+      FALLO_ENTORNO="la base $DB ya existe y no la creó sp-test para este worktree: no la toco"
+      bloque_fallo_entorno back pytest; return 2
+    fi
+    printf 'Prep: ninguno (--sin-prep): pytest corre contra %s tal cual\n' "$DB" >>"$TMPD/back.bloque"
+  else
+    asegurar_postgres || { bloque_fallo_entorno back pytest; return 2; }
+    case "$PG_LINEA" in arrancado*) printf 'Postgres: %s\n' "$PG_LINEA" >>"$TMPD/back.bloque" ;; esac
+    asegurar_bd rapido || { bloque_fallo_entorno back pytest; return 2; }
+    case "$BD_LINEA" in
+      *"ya estaba a head") ;;
+      *) printf 'Base: %s\n' "$BD_LINEA" >>"$TMPD/back.bloque" ;;
+    esac
+  fi
+  tomar_cerrojo || { bloque_fallo_entorno back pytest; return 2; }
+  paso "pytest -q -rfEs --tb=short ${PASS[*]}"
+  (cd "$WT/backend" && env -u ANTHROPIC_API_KEY -u GEMINI_API_KEY -u RESEND_API_KEY -u JEV_API_KEY \
+      ADMIN_DATABASE_URL="$ADMIN_URL" APP_DATABASE_URL="$APP_URL" \
+      PYTHONPATH="$TMPD${PYTHONPATH:+:$PYTHONPATH}" SP_TEST_JSON="$json" \
+      "$SP_PY" -m pytest -q -rfEs --tb=short -p sp_test_resumen "${PASS[@]}") >>"$LOG" 2>&1
+  rc=$?
+  soltar_cerrojo
+  "$SP_PY" "$TMPD/resumir.py" back "$LOG" "$json" "$MAXF" "$WT" "$rc" >>"$TMPD/back.bloque" 2>"$TMPD/back.err"
+  r=$?
+  cat "$TMPD/back.err" >>"$LOG"
+  [ "$r" -le 2 ] || { printf 'VALE: NO — el resumen falló (ver log)\n' >>"$TMPD/back.bloque"; r=2; }
+  return $r
+}
+
+correr_front() {
+  local json="$TMPD/front.json" rc r
+  FALLO_ENTORNO=""
+  nuevo_log front
+  asegurar_node || { bloque_fallo_entorno front vitest; return 2; }
+  paso "npx vitest run ${PASS[*]}"
+  (cd "$WT/frontend" && env -u FORCE_COLOR NO_COLOR=1 \
+      npx vitest run --reporter=default --reporter=json --outputFile.json="$json" "${PASS[@]}") >>"$LOG" 2>&1
+  rc=$?
+  SP_FALTAN="$NODE_FALTAN" "$(python_para_resumir)" "$TMPD/resumir.py" front "$LOG" "$json" "$MAXF" "$WT" "$rc" >"$TMPD/front.bloque" 2>"$TMPD/front.err"
+  r=$?
+  cat "$TMPD/front.err" >>"$LOG"
+  [ "$r" -le 2 ] || { printf 'VALE: NO — el resumen falló (ver log)\n' >>"$TMPD/front.bloque"; r=2; }
+  return $r
+}
+
+correr_tsc() {
+  local rc r
+  FALLO_ENTORNO=""
+  nuevo_log tsc
+  asegurar_node || { bloque_fallo_entorno tsc tsc; return 2; }
+  paso "npx tsc --noEmit --pretty false ${PASS[*]}"
+  (cd "$WT/frontend" && npx tsc --noEmit --pretty false "${PASS[@]}") >>"$LOG" 2>&1
+  rc=$?
+  SP_FALTAN="$NODE_FALTAN" "$(python_para_resumir)" "$TMPD/resumir.py" tsc "$LOG" "-" "$MAXF" "$WT" "$rc" >"$TMPD/tsc.bloque" 2>"$TMPD/tsc.err"
+  r=$?
+  cat "$TMPD/tsc.err" >>"$LOG"
+  [ "$r" -le 2 ] || { printf 'VALE: NO — el resumen falló (ver log)\n' >>"$TMPD/tsc.bloque"; r=2; }
+  return $r
+}
+
+# --- subcomandos ----------------------------------------------------------------------------
+
+T0=$(date +%s)
+segs() { printf '%s' "$(( $(date +%s) - T0 ))"; }
+
+case "$SUB" in
+  prep)
+    FALLO_ENTORNO=""
+    nuevo_log prep
+    ok=0
+    asegurar_node prep && asegurar_python && asegurar_postgres && asegurar_bd completo && ok=1
+    if [ "$ok" = 1 ] && ! comprobar_trampa_venv; then
+      FALLO_ENTORNO="desde backend/, app.__file__ = ${APP_FILE:-?}: fuera del worktree (trampa del .venv enlazado)"
+      ok=0
+    fi
+    printf 'sp-test prep · %s (%s) · bd %s · %s s\n' "$WT_NOMBRE" "$WT" "$DB" "$(segs)"
+    enl=""
+    [ -n "$NODE_LINEA" ] && enl="$NODE_LINEA"
+    [ -n "$PYVENV_LINEA" ] && enl="${enl:+$enl · }$PYVENV_LINEA"
+    [ -n "$enl" ] && printf 'Enlaces: %s\n' "$enl"
+    [ -n "$PG_LINEA" ] && printf 'Postgres: %s\n' "$PG_LINEA"
+    [ -n "$BD_LINEA" ] && printf 'Base: %s\n' "$BD_LINEA"
+    if [ "$ok" = 1 ]; then
+      printf 'app.__file__: %s (dentro del worktree)\n' "$APP_FILE"
+      printf 'LISTO: sí\n'
+    else
+      rojo "LISTO: NO — $FALLO_ENTORNO"
+    fi
+    printf 'Log completo: %s\n' "$LOG"
+    [ "$ok" = 1 ] && exit 0 || exit 2
+    ;;
+
+  back|front|tsc)
+    escribir_ayudantes
+    calcular_huellas
+    "correr_$SUB"; r=$?
+    dejar_constancia "$SUB" "$r"
+    if [ "$SUB" = back ]; then
+      printf 'sp-test back · %s (%s) · bd %s · %s s\n' "$WT_NOMBRE" "$WT" "$DB" "$(segs)"
+    else
+      printf 'sp-test %s · %s (%s) · %s s\n' "$SUB" "$WT_NOMBRE" "$WT" "$(segs)"
+    fi
+    pintar <"$TMPD/$SUB.bloque"
+    printf 'Log completo: %s\n' "$LOG"
+    exit $r
+    ;;
+
+  todo)
+    escribir_ayudantes
+    MAXF=4
+    PASS=()
+    calcular_huellas
+    (
+      t=$(date +%s); correr_back; r=$?
+      printf '%s\n' "$r" >"$TMPD/back.rc"; printf '%s\n' "$(( $(date +%s) - t ))" >"$TMPD/back.segs"
+      printf '%s\n' "$LOG" >"$TMPD/back.log"
+      dejar_constancia back "$r"
+    ) &
+    pid_back=$!
+    t=$(date +%s); correr_tsc; r_tsc=$?; s_tsc=$(( $(date +%s) - t )); log_tsc=$LOG
+    dejar_constancia tsc "$r_tsc"
+    t=$(date +%s); correr_front; r_front=$?; s_front=$(( $(date +%s) - t )); log_front=$LOG
+    dejar_constancia front "$r_front"
+    wait "$pid_back"
+    r_back=$(cat "$TMPD/back.rc" 2>/dev/null || echo 2)
+    s_back=$(cat "$TMPD/back.segs" 2>/dev/null || echo "?")
+    log_back=$(cat "$TMPD/back.log" 2>/dev/null)
+    [ -s "$TMPD/back.bloque" ] || printf 'RESULTADO: back no terminó\nVALE: NO — ver log\n' >"$TMPD/back.bloque"
+    nuevo_log todo
+    r=0
+    for x in "$r_tsc" "$r_front" "$r_back"; do
+      if [ "$x" = 2 ]; then r=2; elif [ "$x" = 1 ] && [ "$r" = 0 ]; then r=1; fi
+    done
+    {
+      printf 'sp-test todo · %s (%s) · bd %s · %s s\n' "$WT_NOMBRE" "$WT" "$DB" "$(segs)"
+      printf -- '— tsc (%s s)\n' "$s_tsc"; cat "$TMPD/tsc.bloque"
+      printf -- '— front (%s s)\n' "$s_front"; cat "$TMPD/front.bloque"
+      printf -- '— back (%s s, en paralelo)\n' "$s_back"; cat "$TMPD/back.bloque"
+      case "$r" in
+        0) printf 'TODO: VALE y en verde\n' ;;
+        1) printf 'TODO: VALE, con fallos\n' ;;
+        *) printf 'TODO: NO VALE (alguna parte no llegó a correr o miente)\n' ;;
+      esac
+    } >"$TMPD/todo.resumen"
+    pintar <"$TMPD/todo.resumen"
+    {
+      cat "$TMPD/todo.resumen"
+      for f in "$log_tsc" "$log_front" "$log_back"; do
+        [ -n "$f" ] && [ -f "$f" ] && { printf '\n\n==================== %s\n' "$f"; cat "$f"; }
+      done
+    } >>"$LOG"
+    printf 'Log completo: %s (tsc, front y back juntos)\n' "$LOG"
+    exit $r
+    ;;
+
+  limpiar)
+    nuevo_log limpiar
+    printf 'sp-test limpiar · %s (%s) · bd %s\n' "$WT_NOMBRE" "$WT" "$DB"
+    r=0
+    if ! command -v psql >/dev/null 2>&1 || ! pg_vivo; then
+      printf 'Base: Postgres no responde, no hay nada que borrar ahora\n'
+    elif ! bd_existe; then
+      printf 'Base: %s no existía\n' "$DB"
+    elif ! bd_es_mia; then
+      rojo "Base: NO la borro: $DB existe y no la creó sp-test para este worktree"
+      r=2
+    else
+      paso "dropdb $DB"
+      if dropdb -h localhost -p 5432 -U "$PG_SUPER" "$DB" >>"$LOG" 2>&1; then
+        printf 'Base: %s borrada\n' "$DB"
+      else
+        rojo "Base: dropdb falló: $(motivo_de "$LOG")"
+        r=2
+      fi
+    fi
+    if [ -f "$MARCA_PG" ]; then
+      if ! pg_vivo; then
+        rm -f "$MARCA_PG"; printf 'Postgres: ya estaba parado\n'
+      else
+        otras=$(psql_su -d postgres -Atc "SELECT count(*) FROM pg_stat_activity WHERE backend_type = 'client backend' AND pid <> pg_backend_pid()" 2>>"$LOG")
+        if [ "${otras:-0}" != 0 ]; then
+          printf 'Postgres: lo arrancó sp-test, pero NO lo paro: hay %s conexiones de otras sesiones\n' "$otras"
+        else
+          metodo=$(cat "$MARCA_PG")
+          paso "parando Postgres ($metodo)"
+          if [ "$metodo" = service ]; then
+            { service postgresql stop || sudo -n service postgresql stop; } >>"$LOG" 2>&1
+          else
+            "$PG_CTL" -D "$PG_DATA" stop >>"$LOG" 2>&1
+          fi
+          if pg_vivo; then rojo "Postgres: no pude pararlo (ver log)"; r=2
+          else rm -f "$MARCA_PG"; printf 'Postgres: parado (lo había arrancado sp-test)\n'; fi
+        fi
+      fi
+    else
+      printf 'Postgres: no lo arrancó sp-test, sigue como estaba\n'
+    fi
+    printf 'Log completo: %s\n' "$LOG"
+    exit $r
+    ;;
+esac

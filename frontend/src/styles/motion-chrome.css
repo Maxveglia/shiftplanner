@@ -1,0 +1,186 @@
+/* Motion for the chrome. Speaks the kit in motion.css; the same rules apply.
+
+   The chrome is what a manager looks past all day to get to the rota, so it
+   moves the least: its entrances are the kit's, shorter and closer; its one
+   continuous gesture is the pill that slides between the sidebar's links;
+   and nothing in it moves while the manager is working in the page -- it
+   answers a click or a hover, and is still again within half a second.
+
+   The page itself enters from script (DashboardLayout: Web Animations on the
+   content, never a held transform); everything here is CSS. */
+
+/* --- The glass ------------------------------------------------------------ */
+
+/* The sidebar is the login's card turned into a column: a dark tint over the
+   stage -- lighter than a card's, so the washes glow through it at the edges
+   -- and never a backdrop blur (it sticks to the viewport, so a blur would be
+   recomputed over the drifting washes on every frame of every screen). The
+   rim along its right edge is a Tailwind border; this adds the light that
+   catches it. */
+.mc-aside {
+  background-color: rgb(10 19 16 / 0.66);
+  box-shadow: inset -1px 0 0 rgb(255 255 255 / 0.02);
+}
+
+/* The pill under the page you are on: menta glass lit from its left edge,
+   where the notch is, with a glow under it like the login's submit. */
+.mc-pill-glass {
+  background-image: linear-gradient(
+    90deg,
+    rgb(68 214 180 / 0.17),
+    rgb(68 214 180 / 0.05) 70%,
+    rgb(68 214 180 / 0.03)
+  );
+  box-shadow:
+    inset 0 0 0 1px rgb(68 214 180 / 0.16),
+    inset 0 1px 0 rgb(255 255 255 / 0.05),
+    0 10px 28px -16px rgb(68 214 180 / 0.6);
+}
+.mc-notch {
+  box-shadow: 0 0 10px 1px rgb(68 214 180 / 0.75);
+}
+
+/* An app's icon at the size of a line of text: its colour's gradient, lit
+   from the top, the mark in white -- the launcher's tile, small. */
+.mc-tile {
+  box-shadow:
+    inset 0 1px 0 rgb(255 255 255 / 0.3),
+    0 6px 16px -8px var(--tile-glow, rgb(68 214 180 / 0.7));
+}
+
+/* --- Arriving, small ------------------------------------------------------ */
+
+/* The kit's rise, at the size of a line of sidebar text. */
+@keyframes mc-rise {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+    filter: blur(3px);
+  }
+}
+.mc-rise {
+  animation: mc-rise 420ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* The sidebar's links come in from the side they are pinned to. */
+@keyframes mc-link-in {
+  from {
+    opacity: 0;
+    transform: translateX(-10px);
+    filter: blur(4px);
+  }
+}
+.mc-link-in {
+  animation: mc-link-in 460ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* The chrome's ripples are menta, whatever the text colour: a grey link would
+   otherwise answer a click with a grey smudge (the shared components do the
+   same with `m-btn-quiet`). The light menta, because the brand's own green
+   is all but the colour of the glass it would spread over. */
+.mc-ink .m-ripple {
+  background: #44d6b4;
+}
+
+/* --- The sidebar's links -------------------------------------------------- */
+
+.mc-link {
+  -webkit-tap-highlight-color: transparent;
+  transition:
+    color 180ms ease,
+    transform 180ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+.mc-link:active {
+  transform: scale(0.98);
+}
+
+/* The pill under the page you are on. The outer box travels (on a spring,
+   whose `linear()` curve DashboardLayout writes into --mc-spring); the face
+   inside it arrives, and stretches along the way when it moves. */
+.mc-pill {
+  position: absolute;
+  left: 0;
+  top: 0;
+  pointer-events: none;
+  transition: transform 460ms cubic-bezier(0.34, 1.3, 0.64, 1);
+}
+@supports (transition-timing-function: linear(0, 1)) {
+  .mc-pill {
+    transition-duration: var(--mc-spring-ms, 460ms);
+    transition-timing-function: var(--mc-spring, cubic-bezier(0.34, 1.3, 0.64, 1));
+  }
+}
+/* Where it starts, it simply is: no gliding in from the corner. */
+.mc-pill[data-still] {
+  transition: none;
+}
+.mc-pill[data-hidden] {
+  opacity: 0;
+}
+
+@keyframes mc-pill-in {
+  from {
+    opacity: 0;
+    transform: scale(0.9);
+    filter: blur(3px);
+  }
+}
+.mc-pill-face {
+  animation: mc-pill-in 520ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* A softer pill that follows the pointer from link to link: the hover of
+   every link, drawn once and sliding, instead of each link lighting up on
+   its own. */
+.mc-hover {
+  position: absolute;
+  left: 0;
+  top: 0;
+  opacity: 0;
+  pointer-events: none;
+  transition:
+    transform 280ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    opacity 200ms ease;
+}
+.mc-hover[data-on] {
+  opacity: 1;
+}
+/* Coming back into the list it fades in under the pointer; only between
+   links does it slide. */
+.mc-hover[data-still] {
+  transition: opacity 200ms ease;
+}
+
+/* --- Leaving -------------------------------------------------------------- */
+
+/* The sign-out icon turns as the launcher's does. */
+.mc-turn {
+  transition: transform 500ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.group:hover .mc-turn,
+.group:focus-visible .mc-turn {
+  transform: rotate(90deg);
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .mc-rise,
+  .mc-link-in,
+  .mc-pill-face {
+    animation: none;
+  }
+  .mc-link,
+  .mc-pill,
+  .mc-hover,
+  .mc-hover[data-still],
+  .mc-turn {
+    transition: none;
+  }
+  .mc-link:active,
+  .group:hover .mc-turn,
+  .group:focus-visible .mc-turn {
+    transform: none;
+  }
+}

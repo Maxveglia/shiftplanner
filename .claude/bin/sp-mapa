@@ -1,0 +1,265 @@
+#!/usr/bin/env python3
+"""sp-mapa: mapa del código para orientarse sin explorar a ciegas.
+
+    sp-mapa                 una línea por carpeta: ficheros, líneas y los 3 más grandes
+    sp-mapa <carpeta>       una línea por fichero: líneas y primera frase de su cabecera
+    sp-mapa <fichero>       lo mismo que sp-outline <fichero>
+    --todo                  sin recortes (todas las carpetas, también las ocultas y los
+                            ficheros no de código; en una carpeta grande, fichero a fichero)
+
+Solo ficheros versionados (git ls-files). La raíz sale de `git rev-parse` desde la
+carpeta actual o, fuera de un checkout, del checkout donde vive este script.
+Solo biblioteca estándar; vale con Python 3.9 (el de macOS) y 3.11+.
+"""
+
+import importlib.machinery
+import importlib.util
+import os
+import subprocess
+import sys
+
+CODE_EXT = {".py", ".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".css", ".sql", ".sh"}
+BINARY_EXT = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico", ".pdf", ".woff", ".woff2",
+              ".ttf", ".otf", ".zip", ".gz", ".mp4", ".mov", ".lock", ".svg"}
+MAX_GROUPS = 46        # líneas de carpetas sin --todo (el mapa cabe en ~50)
+FOLDER_FILES = 150     # una carpeta con más ficheros se resume por subcarpetas
+HEAD_WIDTH = 90
+
+
+def load_outline():
+    sys.dont_write_bytecode = True     # nada de __pycache__ junto a los scripts
+    here = os.path.dirname(os.path.realpath(__file__))
+    path = os.path.join(here, "sp-outline")
+    loader = importlib.machinery.SourceFileLoader("sp_outline", path)
+    spec = importlib.util.spec_from_loader("sp_outline", loader)
+    mod = importlib.util.module_from_spec(spec)
+    loader.exec_module(mod)
+    return mod
+
+
+OL = load_outline()
+
+
+def ls_files(root, rel=None):
+    cmd = ["git", "-C", root, "ls-files", "-z"]
+    if rel:
+        cmd += ["--", rel]
+    try:
+        out = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+                             check=True).stdout
+    except (subprocess.CalledProcessError, OSError):
+        return []
+    return [p for p in out.decode("utf-8", "replace").split("\0") if p]
+
+
+def is_test(path):
+    base = os.path.basename(path)
+    return (base.startswith("test_") or base.endswith("_test.py") or ".test." in base
+            or ".spec." in base or "/tests/" in "/" + path or "/__tests__/" in path)
+
+
+def stats(root, rel):
+    """(líneas, bytes) de un fichero; (0, 0) si ya no está en disco."""
+    try:
+        with open(os.path.join(root, rel), "rb") as fh:
+            raw = fh.read()
+    except OSError:
+        return 0, 0
+    n = raw.count(b"\n")
+    if raw and not raw.endswith(b"\n"):
+        n += 1
+    return n, len(raw)
+
+
+def fmt_lines(n):
+    if n >= 10000:
+        return "%.1fk" % (n / 1000.0)
+    return str(n)
+
+
+def ext_of(path):
+    return os.path.splitext(path)[1].lower()
+
+
+def hidden_dir(path):
+    return any(part.startswith(".") for part in path.split("/")[:-1])
+
+
+# --------------------------------------------------------------------------
+# Sin argumentos: una línea por carpeta
+# --------------------------------------------------------------------------
+
+def summary_line(label, files, width):
+    total = sum(n for _, n in files)
+    tests = sum(1 for p, _ in files if is_test(p))
+    pool = ([f for f in files if not is_test(f[0]) and ext_of(f[0]) in CODE_EXT]
+            or [f for f in files if not is_test(f[0])] or files)
+    top = sorted(pool, key=lambda f: -f[1])[:3]
+    tops = " · ".join("%s %d" % (os.path.basename(p), n) for p, n in top)
+    count = "%d fich" % len(files)
+    if tests and tests != len(files):
+        count += " (%d test)" % tests
+    return "%-*s %-18s %6s lín  %s" % (width, label, count, fmt_lines(total), tops)
+
+
+def group_map(root, paths, todo, base=""):
+    """{carpeta: [(ruta, líneas)]} de los ficheros de código, plegando las
+    carpetas pequeñas en su madre hasta que quepan."""
+    groups = {}
+    for p in paths:
+        if not todo and (ext_of(p) not in CODE_EXT or hidden_dir(p[len(base):])):
+            continue
+        if todo and ext_of(p) in BINARY_EXT:
+            continue
+        d = os.path.dirname(p) or "."
+        groups.setdefault(d, []).append((p, stats(root, p)[0]))
+    folded = {}
+    if not todo:
+        floor = base.rstrip("/").count("/") + (1 if base else 0)
+        while len(groups) > MAX_GROUPS:
+            cands = [d for d in groups if d != "." and d.count("/") + 1 > max(2, floor + 1)]
+            if not cands:
+                break
+            d = min(cands, key=lambda k: (sum(n for _, n in groups[k]), k))
+            parent = os.path.dirname(d)
+            groups.setdefault(parent, []).extend(groups.pop(d))
+            folded.setdefault(parent, []).append(os.path.basename(d))
+            folded[parent].extend(folded.pop(d, []))
+    return groups, folded
+
+
+def cmd_overview(root, todo):
+    paths = ls_files(root)
+    groups, folded = group_map(root, paths, todo)
+    labels = {}
+    for d in groups:
+        lab = d if d != "." else "(raíz)"
+        if d in folded:
+            lab += "/ (+%s)" % ",".join(sorted(folded[d])[:3]) + ("…" if len(folded[d]) > 3 else "")
+        labels[d] = lab
+    width = min(44, max(len(v) for v in labels.values())) if labels else 10
+    n_files = sum(len(v) for v in groups.values())
+    n_lines = sum(n for v in groups.values() for _, n in v)
+    what = "ficheros versionados" if todo else "ficheros de código"
+    out = ["%s · %d %s · %s líneas · sp-mapa <carpeta> | sp-outline <fichero>" % (
+        os.path.basename(root), n_files, what, fmt_lines(n_lines))]
+    for d in sorted(groups):
+        out.append(summary_line(labels[d], groups[d], width))
+    return out
+
+
+# --------------------------------------------------------------------------
+# Una carpeta: una línea por fichero
+# --------------------------------------------------------------------------
+
+def cmd_folder(root, rel, todo):
+    rel = rel.strip("/")
+    paths = [p for p in ls_files(root, rel) if p == rel or p.startswith(rel + "/")]
+    if not todo:
+        paths = [p for p in paths if ext_of(p) not in BINARY_EXT]
+    if not paths:
+        return ["%s · sin ficheros versionados" % rel]
+    base = rel + "/"
+    tot_lines = 0
+    tot_bytes = 0
+    rows = []
+    for p in sorted(paths):
+        n, b = stats(root, p)
+        tot_lines += n
+        tot_bytes += b
+        rows.append((p, n))
+    head = "%s · %d ficheros · %s líneas · ~%s tokens si se leyera todo" % (
+        rel, len(rows), fmt_lines(tot_lines), OL.fmt_tokens(int(tot_bytes / 3.5)))
+    out = [head]
+    if len(rows) > FOLDER_FILES and not todo:
+        # demasiados: los ficheros de la propia carpeta y un resumen por subcarpeta
+        direct = [(p, n) for p, n in rows if "/" not in p[len(base):]]
+        subs = {}
+        for p, n in rows:
+            restp = p[len(base):]
+            if "/" in restp:
+                subs.setdefault(restp.split("/", 1)[0], []).append((p, n))
+        out.append("(más de %d ficheros: resumen por subcarpeta; --todo para verlos todos)"
+                   % FOLDER_FILES)
+        width = min(40, max([len(k) + 1 for k in subs] + [len(p[len(base):]) for p, _ in direct]
+                            + [10]))
+        for k in sorted(subs):
+            out.append(summary_line(k + "/", subs[k], width))
+        out.extend(file_rows(root, base, direct))
+        return out
+    out.extend(file_rows(root, base, rows))
+    return out
+
+
+def file_rows(root, base, rows):
+    if not rows:
+        return []
+    names = [p[len(base):] for p, _ in rows]
+    width = min(46, max(len(n) for n in names))
+    out = []
+    for (p, n), name in zip(rows, names):
+        head = ""
+        if ext_of(p) not in BINARY_EXT:
+            try:
+                text = OL.read_text(os.path.join(root, p))
+            except OSError:
+                text = None
+            if text:
+                try:
+                    head = OL.header_of(p, text)
+                except Exception:
+                    head = ""
+        head = OL.clip(head, HEAD_WIDTH) if head else "—"
+        out.append("%-*s %5d  %s" % (width, name, n, head))
+    return out
+
+
+# --------------------------------------------------------------------------
+
+def main(argv):
+    todo = "--todo" in argv
+    args = [a for a in argv if a != "--todo"]
+    for a in args:
+        if a in ("-h", "--help"):
+            print(__doc__.strip())
+            return 0
+        if a.startswith("-"):
+            sys.stderr.write("sp-mapa: opción desconocida %s\n" % a)
+            return 2
+    root = OL.repo_root()
+    if not root:
+        sys.stderr.write("sp-mapa: no estoy dentro de un checkout de git\n")
+        return 2
+    if not args:
+        print("\n".join(cmd_overview(root, todo)))
+        return 0
+    status = 0
+    for i, a in enumerate(args):
+        path = OL.resolve(a, root)
+        if path is None:
+            sys.stderr.write("sp-mapa: no existe: %s\n" % a)
+            status = 2
+            continue
+        if i:
+            print("")
+        if os.path.isdir(path):
+            rel = OL.display_path(path, root)
+            if rel.startswith("..") or os.path.isabs(rel):
+                sys.stderr.write("sp-mapa: %s está fuera del repo %s\n" % (a, root))
+                status = 2
+                continue
+            if rel == ".":
+                print("\n".join(cmd_overview(root, todo)))
+            else:
+                print("\n".join(cmd_folder(root, rel, todo)))
+        else:
+            opts = {"todo": todo, "min": OL.DEFAULT_MIN, "files": [path]}
+            print("\n".join(OL.build(path, OL.display_path(path, root), opts)))
+    return status
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except BrokenPipeError:
+        sys.exit(0)

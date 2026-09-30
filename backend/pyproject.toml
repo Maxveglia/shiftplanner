@@ -1,0 +1,55 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shiftplanner-backend"
+version = "0.1.0"
+description = "ShiftPlanner Fase 0 backend - multi-tenant scheduling SaaS"
+readme = "README.md"
+requires-python = ">=3.11"
+# Every range here is closed at the top. There is no lock file yet and the
+# image builds with `pip install "."`, so an open `>=` is not a floor: it is a
+# standing instruction to install whatever PyPI published this morning, in a
+# build nobody watches, of the branch that IS the deploy. The upper bound is
+# the next major of each project -- the boundary where its own authors say
+# they may break us -- so a major arrives through a pull request somebody read
+# rather than through a redeploy on a Tuesday.
+dependencies = [
+    "fastapi>=0.110,<1",
+    "uvicorn[standard]>=0.29,<1",
+    "sqlalchemy>=2.0,<3",
+    "psycopg[binary]>=3.1,<4",
+    "alembic>=1.13,<2",
+    "pydantic>=2.6,<3",
+    "pydantic-settings>=2.2,<3",
+    "pyjwt>=2.8,<3",
+    # bcrypt directly, not via passlib: passlib 1.7.4 (unmaintained since 2020)
+    # probes its backend with an over-length password on first use, which
+    # bcrypt >= 4.1 rejects instead of truncating -- every login 500s.
+    "bcrypt>=4.1,<6",
+    # python-multipart has never reached 0.1: for a 0.0.x project the second
+    # zero is the major, so `<1` would cap nothing at all.
+    "python-multipart>=0.0.9,<0.1",
+    # The declared floor was >=0.40, and it was a fiction: `client.messages.parse`
+    # (services/intake.py, refine_intake.py, triage.py) and `output_config`
+    # first appear in the stable Messages resource in 0.77.0 -- 0.76.0 has
+    # neither. A resolver honouring the old floor installed an SDK where the
+    # intake raises AttributeError. 1.3 rather than 0.77 because 1.x is where
+    # the code actually runs, and 0.x -> 1.x is a real break (httpx2, Python
+    # >= 3.10, removed parameters) that no test here has ever covered.
+    "anthropic>=1.3,<2",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "httpx>=0.27",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

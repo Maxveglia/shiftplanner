@@ -1,0 +1,332 @@
+/* Motion for the calendar. Speaks the kit in motion.css; the same rules apply.
+
+   This is the screen a manager keeps open for hours, so it moves the least of
+   anything in the app and never while they work: things arrive (the year,
+   a day, a panel, a note), a pressed thing answers, a publish is celebrated
+   once. Nothing loops for ever, nothing moves under a drag, and every class
+   here is switched off at the end for prefers-reduced-motion.
+
+   The numbers that are not CSS -- the tab arrows, when each month arrives,
+   where a day grows from, the flight of a publish -- are in
+   components/schedule/calendarMotion.ts, with their tests. */
+
+/* --- The view tabs ------------------------------------------------------------ */
+
+/* The pill that marks the chosen tab glides to the next one, and overshoots
+   by a hair so it lands rather than stops. Its first placement does not
+   glide (`data-still`): the pill is simply there. */
+.cal-tab-pill {
+  transition:
+    transform 360ms cubic-bezier(0.34, 1.28, 0.64, 1),
+    width 360ms cubic-bezier(0.34, 1.28, 0.64, 1),
+    height 360ms cubic-bezier(0.34, 1.28, 0.64, 1),
+    opacity 200ms ease;
+}
+.cal-tab-pill[data-still] {
+  transition: none;
+}
+
+/* The panel a tab brings comes in from the side the pill travelled to
+   (`--dir`: -1, 0 or 1), so the eye follows one movement, not two. */
+@keyframes cal-panel-in {
+  from {
+    opacity: 0;
+    transform: translateX(calc(var(--dir, 0) * 14px));
+    filter: blur(3px);
+  }
+}
+.cal-panel-in {
+  animation: cal-panel-in 320ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* --- The year ------------------------------------------------------------------ */
+
+/* Twelve months, one after another, out of a light blur. Only the twelve
+   blocks move -- never the 500 days inside them one by one -- so it stays
+   twelve layers on the compositor however slow the machine. `--d` comes from
+   monthDelay(). */
+@keyframes cal-month-in {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+    filter: blur(4px);
+  }
+}
+.cal-year[data-arrival='cascade'] .cal-month {
+  animation: cal-month-in 480ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: var(--d, 0ms);
+}
+
+/* Coming back from a day the year does not cascade again -- that happens
+   dozens of times a session. It settles, a touch larger to smaller, as if the
+   view were zooming back out of the day. */
+@keyframes cal-year-return {
+  from {
+    opacity: 0;
+    transform: scale(1.012);
+  }
+}
+.cal-year[data-arrival='return'] .cal-months {
+  animation: cal-year-return 260ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* The year number, when the arrows change it. */
+@keyframes cal-year-number {
+  from {
+    opacity: 0;
+    transform: translateY(-6px);
+    filter: blur(3px);
+  }
+}
+.cal-year-number {
+  display: inline-block;
+  animation: cal-year-number 320ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+}
+
+/* A day under the pointer swells on a spring and gives under a press. The
+   colours ease; only the size bounces. */
+.cal-day {
+  transition:
+    background-color 180ms ease,
+    color 180ms ease,
+    box-shadow 180ms ease,
+    transform 320ms cubic-bezier(0.34, 1.56, 0.64, 1);
+}
+.cal-day:hover {
+  transform: scale(1.18);
+}
+.cal-day:active {
+  transform: scale(0.9);
+  transition-duration: 180ms, 180ms, 180ms, 90ms;
+}
+
+/* Today breathes out a ring a few times when the year arrives, then rests:
+   something that pulses all day in the corner of the eye is something a
+   manager learns to hate. */
+.cal-today {
+  position: relative;
+}
+@keyframes cal-today-pulse {
+  from {
+    opacity: 0.7;
+    transform: scale(1);
+  }
+  to {
+    opacity: 0;
+    transform: scale(1.9);
+  }
+}
+.cal-today::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  border-radius: 9999px;
+  /* The launcher's menta-light: the deep menta was 1.3:1 on the dark card. */
+  border: 2px solid rgb(68 214 180 / 0.6);
+  opacity: 0;
+  pointer-events: none;
+  animation: cal-today-pulse 2200ms cubic-bezier(0.2, 0.8, 0.2, 1) 3;
+  animation-delay: calc(var(--d, 0ms) + 650ms);
+}
+
+/* The day just closed, found again: a ring closes in on it, the day view
+   having just shrunk back into the same spot. */
+.cal-landing {
+  position: relative;
+}
+@keyframes cal-landing {
+  0% {
+    opacity: 0;
+    transform: scale(2.6);
+  }
+  45% {
+    opacity: 0.85;
+  }
+  100% {
+    opacity: 0;
+    transform: scale(1);
+  }
+}
+.cal-landing::before {
+  content: '';
+  position: absolute;
+  inset: -3px;
+  border-radius: 9999px;
+  border: 2px solid rgb(68 214 180);
+  box-shadow: 0 0 14px rgb(68 214 180 / 0.45);
+  opacity: 0;
+  pointer-events: none;
+  animation: cal-landing 700ms cubic-bezier(0.2, 0.8, 0.2, 1) 80ms;
+}
+
+/* --- One day ------------------------------------------------------------------- */
+
+/* While a day is arriving (`data-arriving`, set by DayView for its first
+   moments and again when the AI lands a new calendar), each person's row comes
+   in after the one above and their shifts draw themselves from where they
+   start. The bar's BODY is what is animated, never the bar that is dragged:
+   DayGrid positions that one with left/width and reads it under the pointer,
+   and nothing here touches either. Once the attribute goes, a shift dropped
+   in a new place simply appears there. */
+.cal-dayview[data-arriving] [data-employee-row] {
+  --cal-row: 8;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(1) {
+  --cal-row: 0;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(2) {
+  --cal-row: 1;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(3) {
+  --cal-row: 2;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(4) {
+  --cal-row: 3;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(5) {
+  --cal-row: 4;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(6) {
+  --cal-row: 5;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(7) {
+  --cal-row: 6;
+}
+.cal-dayview[data-arriving] [data-employee-row]:nth-child(8) {
+  --cal-row: 7;
+}
+@keyframes cal-name-in {
+  from {
+    opacity: 0;
+    transform: translateX(-6px);
+  }
+}
+.cal-dayview[data-arriving] [data-employee-row] > :first-child {
+  animation: cal-name-in 360ms cubic-bezier(0.16, 1, 0.3, 1) backwards;
+  animation-delay: calc(60ms + var(--cal-row) * 32ms);
+}
+@keyframes cal-bar-in {
+  from {
+    opacity: 0.25;
+    clip-path: inset(0 100% 0 0);
+  }
+}
+.cal-dayview[data-arriving] [data-shift-bar] > :first-child {
+  animation: cal-bar-in 460ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+  animation-delay: calc(140ms + var(--cal-row) * 32ms);
+}
+
+/* --- The brief ------------------------------------------------------------------- */
+
+/* The brief, or an adjustment, sent: a light passes along the box, the way a
+   page is read. Aria-hidden and under the text. */
+@keyframes cal-sheen {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(100%);
+  }
+}
+.cal-sheen {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background: linear-gradient(
+    100deg,
+    transparent 25%,
+    rgb(68 214 180 / 0.16) 45%,
+    rgb(14 124 102 / 0.14) 52%,
+    transparent 72%
+  );
+  transform: translateX(-100%);
+  animation: cal-sheen 900ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* The adjustment box empties as it is sent; the sentence lifts out of it
+   instead of blinking away, so it is plain where it went. */
+@keyframes cal-sent {
+  from {
+    opacity: 0.9;
+    transform: translateY(-50%);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(calc(-50% - 16px));
+    filter: blur(3px);
+  }
+}
+.cal-sent {
+  position: absolute;
+  top: 50%;
+  pointer-events: none;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  animation: cal-sent 560ms cubic-bezier(0.4, 0, 0.2, 1) forwards;
+}
+
+/* --- Publishing ------------------------------------------------------------------ */
+
+/* The pieces of the mark thrown up by a publish (PublishBurst): out fast and
+   decelerating to the top of their arc, then falling faster and fading.
+   Per-piece numbers come from burstPieces(). */
+@keyframes cal-burst {
+  0% {
+    opacity: 0;
+    transform: translate(0, 0) rotate(0deg) scale(0.3);
+    animation-timing-function: cubic-bezier(0.15, 0.75, 0.35, 1);
+  }
+  8% {
+    opacity: 1;
+  }
+  40% {
+    transform: translate(var(--x1), var(--y1)) rotate(calc(var(--r) * 0.4)) scale(1);
+    animation-timing-function: cubic-bezier(0.5, 0, 0.9, 0.55);
+  }
+  75% {
+    opacity: 1;
+  }
+  100% {
+    opacity: 0;
+    transform: translate(var(--x2), var(--y2)) rotate(var(--r)) scale(0.85);
+  }
+}
+.cal-burst-piece {
+  position: absolute;
+  left: 0;
+  top: 0;
+  overflow: visible;
+  opacity: 0;
+  animation: cal-burst var(--dur, 1000ms) linear var(--delay, 0ms) backwards;
+}
+
+/* --- Off, for anyone who asked for less motion ------------------------------------ */
+
+@media (prefers-reduced-motion: reduce) {
+  .cal-tab-pill {
+    transition: none;
+  }
+  .cal-panel-in,
+  .cal-year[data-arrival] .cal-month,
+  .cal-year[data-arrival] .cal-months,
+  .cal-year-number,
+  .cal-dayview[data-arriving] [data-employee-row] > :first-child,
+  .cal-dayview[data-arriving] [data-shift-bar] > :first-child {
+    animation: none;
+  }
+  .cal-day {
+    transition: none;
+  }
+  .cal-day:hover,
+  .cal-day:active {
+    transform: none;
+  }
+  .cal-today::after,
+  .cal-landing::before,
+  .cal-sheen,
+  .cal-sent,
+  .cal-burst {
+    display: none;
+  }
+}
